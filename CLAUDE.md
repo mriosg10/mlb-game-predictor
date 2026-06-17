@@ -10,6 +10,12 @@ The following actions do NOT require confirmation — proceed directly:
 - Git commits and pushes to the `mlb-game-predictor` repo (remote: github.com/mriosg10/mlb-game-predictor)
 - Updating the crontab (credentials live in `~/.mlb_env`, never in the crontab itself)
 - Editing any file in this project directory
+- Running bash commands (Bash tool) for any project-related task
+- Reading any file in this project directory (Read tool)
+- Writing or creating files in this project directory (Write tool)
+- Running background tasks and monitoring their output
+- Fetching web URLs related to MLB data sources (WebFetch tool)
+- Searching the web for MLB/baseball data or Python library documentation (WebSearch tool)
 
 ## Project overview
 XGBoost pipeline that predicts MLB game win probability and run totals daily.
@@ -23,7 +29,7 @@ Entry point: `python3 main.py --cycle A|B|post [--date YYYY-MM-DD]`
 ## Key architecture facts
 - **Database**: DuckDB at `mlb_predictions.duckdb` — 4 tables: `features`, `predictions`, `results`, `evaluation_log`
 - **Models**: `models/xgb_win_prob.json` (classifier) + `models/xgb_run_total.json` (regressor)
-- **Feature vector**: 49 columns defined in `config.FEATURE_COLUMNS` — order must match exactly between training and inference
+- **Feature vector**: 53 columns defined in `config.FEATURE_COLUMNS` — order must match exactly between training and inference
 - **Missing feature gate**: games with >30% features missing are excluded from inference (AC-10)
 
 ## Known workarounds

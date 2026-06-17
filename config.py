@@ -128,16 +128,18 @@ VENUE_COORDS: dict[str, dict] = {
 # degrees 0-360) is the model input derived from it.
 # ---------------------------------------------------------------------------
 FEATURE_COLUMNS: list[str] = [
-    # Home starting pitcher (13)
+    # Home starting pitcher (15)
     "home_sp_xera",    "home_sp_fip",      "home_sp_xfip",       "home_sp_siera",
     "home_sp_k_pct",   "home_sp_bb_pct",   "home_sp_barrel",     "home_sp_hh_pct",
     "home_sp_exit_velo","home_sp_spin",    "home_sp_days_rest",
     "home_sp_hand_match_pct",              "home_sp_bvp_woba",
-    # Away starting pitcher (13)
+    "home_sp_era_l3",  "home_sp_whip_l3",
+    # Away starting pitcher (15)
     "away_sp_xera",    "away_sp_fip",      "away_sp_xfip",       "away_sp_siera",
     "away_sp_k_pct",   "away_sp_bb_pct",   "away_sp_barrel",     "away_sp_hh_pct",
     "away_sp_exit_velo","away_sp_spin",    "away_sp_days_rest",
     "away_sp_hand_match_pct",              "away_sp_bvp_woba",
+    "away_sp_era_l3",  "away_sp_whip_l3",
     # Home bullpen (4)
     "home_bp_xera",    "home_bp_ip_3d",    "home_bp_li",         "home_bp_il_ct",
     # Away bullpen (4)
@@ -172,6 +174,8 @@ LEAGUE_AVG: dict[str, float] = {
     "sp_days_rest":     5,
     "sp_hand_match_pct":0.50,
     "sp_bvp_woba":      0.320,
+    "sp_era_l3":        4.20,
+    "sp_whip_l3":       1.28,
     "bp_xera":          4.20,
     "bp_ip_3d":         9.0,
     "bp_li":            1.00,

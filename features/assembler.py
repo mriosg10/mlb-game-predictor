@@ -22,7 +22,7 @@ from config import (
 )
 from fetchers import fangraphs, mlb_stats, savant, weather as weather_fetcher
 from fetchers.fangraphs import get_pitcher_savant_extras
-from fetchers.mlb_stats import get_team_run_diff
+from fetchers.mlb_stats import get_team_run_diff, get_pitcher_recent_form
 
 logger = logging.getLogger(__name__)
 
@@ -181,6 +181,17 @@ def _build_pitcher_features(
     else:
         feats[f"{prefix}_days_rest"] = int(LEAGUE_AVG["sp_days_rest"])
         missing.append(f"{prefix}_days_rest")
+
+    # Recent form — last 3 starts ERA and WHIP
+    if pitcher_id:
+        rf = get_pitcher_recent_form(pitcher_id, game_date, n_starts=3)
+        feats[f"{prefix}_era_l3"]  = rf["era_l3"]
+        feats[f"{prefix}_whip_l3"] = rf["whip_l3"]
+    else:
+        feats[f"{prefix}_era_l3"]  = LEAGUE_AVG["sp_era_l3"]
+        feats[f"{prefix}_whip_l3"] = LEAGUE_AVG["sp_whip_l3"]
+        missing.append(f"{prefix}_era_l3")
+        missing.append(f"{prefix}_whip_l3")
 
     # Handedness match
     feats[f"{prefix}_hand_match_pct"] = _compute_hand_match_pct(pitcher_hand, batting_order)

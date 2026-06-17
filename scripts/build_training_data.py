@@ -325,7 +325,84 @@ def fetch_team_batting(season: int) -> dict[str, dict]:
 
 
 # ---------------------------------------------------------------------------
-# 4. Player name lookup
+# 4. Pitcher game logs (for rolling ERA/WHIP per start)
+# ---------------------------------------------------------------------------
+
+def _parse_ip(ip_str) -> float:
+    """Convert MLB API inningsPitched string ('5.2') to decimal innings."""
+    try:
+        raw = float(ip_str or 0)
+        whole = int(raw)
+        thirds = round(raw - whole, 1)
+        # .1 = 1/3, .2 = 2/3 — convert to decimal
+        return whole + (thirds / 0.3) * (1 / 3)
+    except Exception:
+        return 0.0
+
+
+def fetch_pitcher_game_logs(season: int, pitcher_ids: list) -> dict:
+    """Returns {pitcher_id: sorted list of start entries} for all pitchers in season."""
+    cache_key = f"pitcher_gamelogs_{season}"
+    cached = _load(cache_key)
+    if cached:
+        logger.info("Pitcher game-log cache hit for %d (%d pitchers)", season, len(cached))
+        return {int(k): v for k, v in cached.items()}
+
+    unique_ids = [pid for pid in set(pitcher_ids) if pid]
+    logger.info("Fetching game logs for %d pitchers in %d ...", len(unique_ids), season)
+    result: dict[int, list] = {}
+
+    for i, pid in enumerate(unique_ids):
+        if i % 100 == 0 and i > 0:
+            logger.info("  game logs: %d/%d ...", i, len(unique_ids))
+        try:
+            data = _mlb_get(f"/people/{pid}/stats", params={
+                "stats": "gameLog", "group": "pitching", "season": season,
+            })
+            starts = []
+            for grp in data.get("stats", []):
+                for split in grp.get("splits", []):
+                    st = split.get("stat", {})
+                    if int(st.get("gamesStarted", 0)) < 1:
+                        continue
+                    ip = _parse_ip(st.get("inningsPitched", 0))
+                    starts.append({
+                        "date": split.get("date", ""),
+                        "er":   int(st.get("earnedRuns", 0)),
+                        "h":    int(st.get("hits", 0)),
+                        "bb":   int(st.get("baseOnBalls", 0)),
+                        "ip":   ip,
+                    })
+            starts.sort(key=lambda x: x["date"])
+            result[pid] = starts
+        except Exception as e:
+            logger.debug("game log failed for pitcher %d: %s", pid, e)
+            result[pid] = []
+        time.sleep(0.08)
+
+    _save(cache_key, {str(k): v for k, v in result.items()})
+    logger.info("  -> %d pitchers cached for %d", len(result), season)
+    return result
+
+
+def _era_whip_l3(game_logs: dict, pitcher_id, game_date: str, n: int = 3) -> tuple:
+    """Compute ERA and WHIP over last n starts before game_date."""
+    if not pitcher_id or pitcher_id not in game_logs:
+        return LEAGUE_AVG["sp_era_l3"], LEAGUE_AVG["sp_whip_l3"]
+    prev = [s for s in game_logs[int(pitcher_id)] if s["date"] < game_date]
+    recent = prev[-n:]
+    if not recent:
+        return LEAGUE_AVG["sp_era_l3"], LEAGUE_AVG["sp_whip_l3"]
+    total_ip = sum(s["ip"] for s in recent)
+    if total_ip < 0.1:
+        return LEAGUE_AVG["sp_era_l3"], LEAGUE_AVG["sp_whip_l3"]
+    era  = float(np.clip((sum(s["er"] for s in recent) / total_ip) * 9, 0.0, 15.0))
+    whip = float(np.clip((sum(s["h"] for s in recent) + sum(s["bb"] for s in recent)) / total_ip, 0.0, 4.0))
+    return era, whip
+
+
+# ---------------------------------------------------------------------------
+# 4b. Player name lookup
 # ---------------------------------------------------------------------------
 
 _name_cache: dict[int, str] = {}
@@ -377,12 +454,15 @@ def _pf(home_team: str) -> dict:
         "hr":   hc.get("hr",   LEAGUE_AVG["park_factor_hr"]),
     }
 
-def build_feature_row(game: dict, pitchers: dict, batting: dict) -> dict:
+def build_feature_row(game: dict, pitchers: dict, batting: dict, game_logs: dict) -> dict:
     home_sp = _sp(game.get("home_sp_id"), pitchers)
     away_sp = _sp(game.get("away_sp_id"), pitchers)
     home_b  = _team(game["home_team"], batting)
     away_b  = _team(game["away_team"], batting)
     pf      = _pf(game["home_team"])
+
+    h_era_l3, h_whip_l3 = _era_whip_l3(game_logs, game.get("home_sp_id"), game["game_date"])
+    a_era_l3, a_whip_l3 = _era_whip_l3(game_logs, game.get("away_sp_id"), game["game_date"])
 
     def _fip_bp(sp_stats):
         """Bullpen xERA proxy: SP xFIP * 1.05 (bullpen ERA typically slightly higher)."""
@@ -408,6 +488,8 @@ def build_feature_row(game: dict, pitchers: dict, batting: dict) -> dict:
         "home_sp_days_rest":     int(LEAGUE_AVG["sp_days_rest"]),
         "home_sp_hand_match_pct":LEAGUE_AVG["sp_hand_match_pct"],
         "home_sp_bvp_woba":      LEAGUE_AVG["sp_bvp_woba"],
+        "home_sp_era_l3":        h_era_l3,
+        "home_sp_whip_l3":       h_whip_l3,
         # Away SP
         "away_sp_xera":          away_sp["xera"],
         "away_sp_fip":           away_sp["fip"],
@@ -422,6 +504,8 @@ def build_feature_row(game: dict, pitchers: dict, batting: dict) -> dict:
         "away_sp_days_rest":     int(LEAGUE_AVG["sp_days_rest"]),
         "away_sp_hand_match_pct":LEAGUE_AVG["sp_hand_match_pct"],
         "away_sp_bvp_woba":      LEAGUE_AVG["sp_bvp_woba"],
+        "away_sp_era_l3":        a_era_l3,
+        "away_sp_whip_l3":       a_whip_l3,
         # Home BP
         "home_bp_xera":   _fip_bp(home_sp),
         "home_bp_ip_3d":  LEAGUE_AVG["bp_ip_3d"],
@@ -479,6 +563,11 @@ def main():
             logger.warning("No games for %d; skipping", season)
             continue
 
+        # Fetch game logs for rolling ERA/WHIP (current season)
+        all_sp_ids = [g.get("home_sp_id") for g in games] + [g.get("away_sp_id") for g in games]
+        all_sp_ids = [pid for pid in all_sp_ids if pid]
+        game_logs = fetch_pitcher_game_logs(season, all_sp_ids)
+
         # Batch-resolve names to warm name cache (avoids per-game API calls)
         ids_needed = {int(g[k]) for g in games for k in ("home_sp_id","away_sp_id") if g.get(k)}
         ids_missing = ids_needed - set(pitchers.keys())
@@ -488,7 +577,7 @@ def main():
                 resolve_name(pid)
 
         for game in games:
-            row = build_feature_row(game, pitchers, batting)
+            row = build_feature_row(game, pitchers, batting, game_logs)
             all_rows.append(row)
             hs, as_ = game["home_score"], game["away_score"]
             all_results.append({

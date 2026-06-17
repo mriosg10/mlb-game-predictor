@@ -264,6 +264,80 @@ def get_venue_info(venue_id: int) -> dict:
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
+# Pitcher recent form — last N starts ERA and WHIP
+# ---------------------------------------------------------------------------
+
+_recent_form_cache: dict[tuple, dict] = {}
+
+def get_pitcher_recent_form(pitcher_id: int, game_date: date, n_starts: int = 3) -> dict:
+    """
+    Return ERA and WHIP over the pitcher's last `n_starts` starts prior to game_date.
+    Falls back to league average if the game log is unavailable or too short.
+    """
+    from config import CURRENT_SEASON, LEAGUE_AVG
+    cache_key = (pitcher_id, game_date, n_starts)
+    if cache_key in _recent_form_cache:
+        return _recent_form_cache[cache_key]
+
+    defaults = {
+        "era_l3":  LEAGUE_AVG["sp_era_l3"],
+        "whip_l3": LEAGUE_AVG["sp_whip_l3"],
+    }
+
+    try:
+        data = _get(
+            f"/people/{pitcher_id}/stats",
+            params={
+                "stats":  "gameLog",
+                "group":  "pitching",
+                "season": CURRENT_SEASON,
+            },
+        )
+        splits = data.get("stats", [{}])[0].get("splits", [])
+        # Filter to starts before game_date, sorted oldest→newest
+        starts = [
+            s for s in splits
+            if s.get("stat", {}).get("gamesStarted", 0) > 0
+            and s.get("date", "") < game_date.strftime("%Y-%m-%d")
+        ]
+        if not starts:
+            _recent_form_cache[cache_key] = defaults
+            return defaults
+
+        recent = starts[-n_starts:]  # last N starts
+
+        total_er = sum(s["stat"].get("earnedRuns", 0) for s in recent)
+        total_h  = sum(s["stat"].get("hits", 0) for s in recent)
+        total_bb = sum(s["stat"].get("baseOnBalls", 0) for s in recent)
+
+        # Parse innings pitched (e.g. "6.2" = 6 and 2/3 innings)
+        total_ip = 0.0
+        for s in recent:
+            ip_str = str(s["stat"].get("inningsPitched", "0.0"))
+            try:
+                whole, thirds = ip_str.split(".")
+                total_ip += int(whole) + int(thirds) / 3
+            except Exception:
+                pass
+
+        if total_ip < 0.1:
+            _recent_form_cache[cache_key] = defaults
+            return defaults
+
+        era_l3  = round((total_er / total_ip) * 9, 2)
+        whip_l3 = round((total_h + total_bb) / total_ip, 3)
+
+        result = {"era_l3": era_l3, "whip_l3": whip_l3}
+        _recent_form_cache[cache_key] = result
+        return result
+
+    except Exception as exc:
+        logger.debug("recent form fetch failed for pitcher %d: %s", pitcher_id, exc)
+        _recent_form_cache[cache_key] = defaults
+        return defaults
+
+
+# ---------------------------------------------------------------------------
 # Team rolling batting stats (14-day OPS and RISP avg)
 # ---------------------------------------------------------------------------
 

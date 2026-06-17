@@ -42,6 +42,8 @@ CREATE TABLE IF NOT EXISTS features (
   home_sp_days_rest     INT,
   home_sp_hand_match_pct FLOAT,
   home_sp_bvp_woba      FLOAT,
+  home_sp_era_l3        FLOAT,
+  home_sp_whip_l3       FLOAT,
   -- Away starting pitcher (13)
   away_sp_xera          FLOAT,
   away_sp_fip           FLOAT,
@@ -56,6 +58,8 @@ CREATE TABLE IF NOT EXISTS features (
   away_sp_days_rest     INT,
   away_sp_hand_match_pct FLOAT,
   away_sp_bvp_woba      FLOAT,
+  away_sp_era_l3        FLOAT,
+  away_sp_whip_l3       FLOAT,
   -- Home bullpen (4)
   home_bp_xera          FLOAT,
   home_bp_ip_3d         FLOAT,
@@ -150,13 +154,26 @@ def get_conn():
         conn.close()
 
 
+_FEATURES_MIGRATIONS = [
+    "ALTER TABLE features ADD COLUMN IF NOT EXISTS home_sp_era_l3  FLOAT",
+    "ALTER TABLE features ADD COLUMN IF NOT EXISTS home_sp_whip_l3 FLOAT",
+    "ALTER TABLE features ADD COLUMN IF NOT EXISTS away_sp_era_l3  FLOAT",
+    "ALTER TABLE features ADD COLUMN IF NOT EXISTS away_sp_whip_l3 FLOAT",
+]
+
+
 def init_db() -> None:
-    """Create all tables if they do not exist."""
+    """Create all tables if they do not exist, and run column migrations."""
     with get_conn() as conn:
         conn.execute(_DDL_FEATURES)
         conn.execute(_DDL_PREDICTIONS)
         conn.execute(_DDL_RESULTS)
         conn.execute(_DDL_EVALUATION_LOG)
+        for stmt in _FEATURES_MIGRATIONS:
+            try:
+                conn.execute(stmt)
+            except Exception:
+                pass
     logger.info("Database schema initialised at %s", DB_PATH)
 
 
@@ -187,15 +204,18 @@ def insert_prediction(
 ) -> str:
     pred_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc)
-    sql = """
+    # Delete any existing prediction for this game+cycle before inserting,
+    # so re-running a cycle always reflects the latest model output.
+    sql_delete = "DELETE FROM predictions WHERE game_id = $1 AND cycle = $2"
+    sql_insert = """
         INSERT INTO predictions
           (prediction_id, game_id, cycle, home_win_prob, away_win_prob,
            predicted_total, model_version, created_at)
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-        ON CONFLICT (prediction_id) DO NOTHING
     """
     with get_conn() as conn:
-        conn.execute(sql, [
+        conn.execute(sql_delete, [game_id, cycle])
+        conn.execute(sql_insert, [
             pred_id, game_id, cycle,
             home_win_prob, round(1.0 - home_win_prob, 6),
             predicted_total, model_version, now,
