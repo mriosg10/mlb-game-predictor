@@ -514,6 +514,142 @@ def get_bullpen_ip_3d(team_id: int, end_date: date) -> float:
     return result
 
 
+# ---------------------------------------------------------------------------
+# Umpire assignments (pre-game) and career stats
+# ---------------------------------------------------------------------------
+
+_umpire_assign_cache: dict[str, dict] = {}   # date_str → {game_pk: {name, id}}
+_umpire_stats_cache:  dict[str, dict] = {}   # umpire_name → stats dict
+
+
+def get_umpire_assignments(game_date: date) -> dict:
+    """
+    Return {game_pk_str: {name, id}} for the HP umpire of each game on game_date.
+    Umpires are typically assigned by 8 AM ET day-of.
+    """
+    date_str = game_date.strftime("%Y-%m-%d")
+    if date_str in _umpire_assign_cache:
+        return _umpire_assign_cache[date_str]
+
+    result: dict = {}
+    try:
+        data = _get("/schedule", params={
+            "sportId": 1,
+            "date": date_str,
+            "hydrate": "officials",
+        })
+        for day in data.get("dates", []):
+            for g in day.get("games", []):
+                pk = str(g["gamePk"])
+                result[pk] = {"name": "TBD", "id": None}
+                for official in g.get("officials", []):
+                    if official.get("officialType") == "Home Plate":
+                        person = official.get("official", {})
+                        result[pk] = {
+                            "name": person.get("fullName", "TBD"),
+                            "id":   person.get("id"),
+                        }
+                        break
+    except Exception as exc:
+        logger.debug("umpire assignments failed for %s: %s", date_str, exc)
+
+    _umpire_assign_cache[date_str] = result
+    return result
+
+
+def get_umpire_career_stats(umpire_name: str) -> dict:
+    """
+    Fetch career umpire stats from umpscorecards.com.
+    Returns {avg_runs, k_rate_pct, tendency} or {} on failure.
+    """
+    if not umpire_name or umpire_name == "TBD":
+        return {}
+    if umpire_name in _umpire_stats_cache:
+        return _umpire_stats_cache[umpire_name]
+
+    try:
+        resp = requests.get(
+            "https://umpscorecards.com/api/umpires/",
+            timeout=8,
+            headers={"User-Agent": "mlb-predictor/1.0"},
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            entries = data if isinstance(data, list) else data.get("umpires", [])
+            name_lower = umpire_name.lower()
+            for ump in entries:
+                ump_name = (ump.get("name") or ump.get("umpire") or "").lower()
+                if not ump_name:
+                    continue
+                if name_lower in ump_name or ump_name in name_lower:
+                    avg_r = float(ump.get("avg_runs", ump.get("runs_per_game", 0)) or 0)
+                    k_r   = float(ump.get("k_rate", ump.get("strikeout_rate", 0)) or 0)
+                    if k_r < 1:
+                        k_r *= 100  # convert fraction to pct if needed
+                    favor = ump.get("home_favor", ump.get("favor", 0)) or 0
+                    tend  = "Favors Over" if avg_r > 9.5 else ("Favors Under" if avg_r < 8.5 else "Neutral O/U")
+                    stats = {
+                        "avg_runs":   round(avg_r, 1),
+                        "k_rate_pct": round(k_r, 1),
+                        "tendency":   tend,
+                    }
+                    _umpire_stats_cache[umpire_name] = stats
+                    return stats
+    except Exception as exc:
+        logger.debug("umpscorecards fetch failed for '%s': %s", umpire_name, exc)
+
+    _umpire_stats_cache[umpire_name] = {}
+    return {}
+
+
+# ---------------------------------------------------------------------------
+# Team recent W-L record (from local results table)
+# ---------------------------------------------------------------------------
+
+def get_team_recent_record(team_abbr: str, before_date: date, n: int = 10) -> dict:
+    """
+    Return {wins, losses, avg_runs_scored, avg_runs_allowed} over last n games
+    before before_date, from the local DuckDB results table.
+    """
+    from config import DB_PATH
+    try:
+        import duckdb
+        conn = duckdb.connect(DB_PATH, read_only=True)
+        rows = conn.execute("""
+            SELECT home_team, away_team, home_score, away_score
+            FROM results
+            WHERE (home_team = $1 OR away_team = $1)
+              AND game_date < $2
+            ORDER BY game_date DESC
+            LIMIT $3
+        """, [team_abbr, before_date.strftime("%Y-%m-%d"), n]).fetchall()
+        conn.close()
+    except Exception as exc:
+        logger.debug("recent record query failed for %s: %s", team_abbr, exc)
+        return {}
+
+    if not rows:
+        return {}
+
+    wins = losses = rs = ra = 0
+    for home, away, hs, as_ in rows:
+        if home == team_abbr:
+            rs += hs; ra += as_
+            wins += (1 if hs > as_ else 0); losses += (1 if hs < as_ else 0)
+        else:
+            rs += as_; ra += hs
+            wins += (1 if as_ > hs else 0); losses += (1 if as_ < hs else 0)
+
+    g = len(rows)
+    return {
+        "wins":  wins,
+        "losses": losses,
+        "games": g,
+        "avg_rs": round(rs / g, 1),
+        "avg_ra": round(ra / g, 1),
+    }
+
+
 def get_active_roster(team_id: int) -> list[dict]:
     """Return list of active roster players with position and bat-side."""
     try:
