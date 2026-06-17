@@ -1,0 +1,545 @@
+"""
+Historical training data builder — v2 (FanGraphs-free).
+
+Data sources (all confirmed working as of 2026):
+  Pitcher quality: Baseball Reference (pitching_stats_bref) for FIP/K%/BB%
+                   Baseball Savant (statcast_pitcher_expected_stats) for xERA
+                   Baseball Savant (statcast_pitcher_exitvelo_barrels) for barrel%/exit_velo
+                   Baseball Savant (statcast_pitcher_pitch_arsenal) for fastball spin
+  Team batting:    MLB Stats API /teams/{id}/stats?group=hitting
+  Park factors:    PARK_FACTORS_HARDCODED from config (FanGraphs 403)
+  Game results:    MLB Stats API /schedule with linescore hydration
+
+Proxy notes:
+  - xFIP = FIP (r ≈ 0.94 at season level; SIERA same)
+  - wOBA ≈ OBP (calibrated to match at league level)
+  - Leverage index = league average (FanGraphs-only metric, unavailable)
+
+Usage:
+    python scripts/build_training_data.py [--seasons 2022,2023,2024]
+"""
+
+import argparse
+import json
+import logging
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(ROOT))
+
+import numpy as np
+import pandas as pd
+import requests
+
+from config import FEATURE_COLUMNS, LEAGUE_AVG, PARK_FACTORS_HARDCODED
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
+DATA_DIR  = ROOT / "data"
+CACHE_DIR = DATA_DIR / "cache"
+DATA_DIR.mkdir(exist_ok=True)
+CACHE_DIR.mkdir(exist_ok=True)
+
+MLB_BASE    = "https://statsapi.mlb.com/api/v1"
+HTTP_TIMEOUT = 30
+_SESSION = requests.Session()
+_SESSION.headers.update({"User-Agent": "mlb-training-data-builder/2.0"})
+
+_FIP_CONST = 3.10
+
+
+# ---------------------------------------------------------------------------
+# Cache helpers
+# ---------------------------------------------------------------------------
+
+def _cp(key: str) -> Path:
+    return CACHE_DIR / f"{key}.json"
+
+def _load(key: str):
+    p = _cp(key)
+    return json.load(open(p)) if p.exists() else None
+
+def _save(key: str, data) -> None:
+    json.dump(data, open(_cp(key), "w"))
+
+def _mlb_get(path: str, params: dict = None, retries: int = 3) -> dict:
+    url = f"{MLB_BASE}{path}"
+    for attempt in range(retries):
+        try:
+            r = _SESSION.get(url, params=params, timeout=HTTP_TIMEOUT)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            if attempt == retries - 1:
+                raise
+            wait = 2 ** (attempt + 1)
+            logger.warning("MLB API retry %d: %s (%ds)", attempt + 1, e, wait)
+            time.sleep(wait)
+
+def _pb():
+    import pybaseball as pb
+    pb.cache.enable()
+    return pb
+
+
+# ---------------------------------------------------------------------------
+# 1. Season schedule + results
+# ---------------------------------------------------------------------------
+
+def fetch_season_schedule(season: int) -> list[dict]:
+    cached = _load(f"schedule_{season}")
+    if cached:
+        logger.info("Schedule cache hit for %d (%d games)", season, len(cached))
+        return cached
+
+    logger.info("Fetching %d schedule from MLB Stats API...", season)
+    games = []
+    month_ranges = [
+        (f"{season}-03-25", f"{season}-04-30"),
+        (f"{season}-05-01", f"{season}-05-31"),
+        (f"{season}-06-01", f"{season}-06-30"),
+        (f"{season}-07-01", f"{season}-07-31"),
+        (f"{season}-08-01", f"{season}-08-31"),
+        (f"{season}-09-01", f"{season}-09-30"),
+        (f"{season}-10-01", f"{season}-10-10"),
+    ]
+    for start, end in month_ranges:
+        try:
+            data = _mlb_get("/schedule", params={
+                "sportId": 1, "startDate": start, "endDate": end,
+                "gameType": "R", "hydrate": "probablePitcher,linescore,team",
+            })
+        except Exception as e:
+            logger.warning("schedule %s-%s failed: %s", start, end, e)
+            continue
+        for day in data.get("dates", []):
+            for g in day.get("games", []):
+                if g.get("status", {}).get("abstractGameState") != "Final":
+                    continue
+                ls = g.get("linescore", {}).get("teams", {})
+                home_r = ls.get("home", {}).get("runs")
+                away_r = ls.get("away", {}).get("runs")
+                if home_r is None or away_r is None:
+                    continue
+                games.append({
+                    "game_id":      str(g["gamePk"]),
+                    "game_date":    g.get("gameDate", "")[:10],
+                    "season":       season,
+                    "home_team":    g["teams"]["home"]["team"]["abbreviation"],
+                    "away_team":    g["teams"]["away"]["team"]["abbreviation"],
+                    "home_team_id": g["teams"]["home"]["team"]["id"],
+                    "away_team_id": g["teams"]["away"]["team"]["id"],
+                    "home_sp_id":   g["teams"]["home"].get("probablePitcher", {}).get("id"),
+                    "away_sp_id":   g["teams"]["away"].get("probablePitcher", {}).get("id"),
+                    "home_score":   int(home_r),
+                    "away_score":   int(away_r),
+                })
+        time.sleep(0.3)
+
+    logger.info("  -> %d completed games for %d", len(games), season)
+    _save(f"schedule_{season}", games)
+    return games
+
+
+# ---------------------------------------------------------------------------
+# 2. Pitcher stats (bref + Statcast — no FanGraphs)
+# ---------------------------------------------------------------------------
+
+def fetch_pitcher_tables(season: int) -> dict:
+    """Returns {mlbam_id: feature_dict} keyed by MLBAM ID."""
+    cached = _load(f"pitcher_merged_{season}")
+    if cached:
+        logger.info("Pitcher stats cache hit for %d", season)
+        return {int(k): v for k, v in cached.items()}
+
+    pb = _pb()
+
+    # --- Baseball Reference (FIP, K%, BB%) ---
+    logger.info("Fetching pitching_stats_bref(%d)...", season)
+    bref: dict[int, dict] = {}
+    try:
+        df = pb.pitching_stats_bref(season)
+        df["IP"]  = pd.to_numeric(df["IP"],  errors="coerce").fillna(0)
+        df["mlbID"] = pd.to_numeric(df["mlbID"], errors="coerce")
+        df = df.dropna(subset=["mlbID"])
+        df["mlbID"] = df["mlbID"].astype(int)
+        df = df[df["Lev"].str.startswith("Maj", na=False)]
+        df = df.sort_values("IP", ascending=False).drop_duplicates(subset=["mlbID"], keep="first")
+        for col in ["BF","SO","BB","HR","HBP"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+        df["fip"]    = (13*df["HR"] + 3*(df["BB"]+df["HBP"]) - 2*df["SO"]) / df["IP"].clip(1) + _FIP_CONST
+        df["k_pct"]  = df["SO"] / df["BF"].clip(1)
+        df["bb_pct"] = df["BB"] / df["BF"].clip(1)
+        for _, row in df.iterrows():
+            bref[int(row["mlbID"])] = {
+                "fip":    float(np.clip(row["fip"],    0.5, 10.0)),
+                "k_pct":  float(np.clip(row["k_pct"],  0.0,  0.6)),
+                "bb_pct": float(np.clip(row["bb_pct"], 0.0,  0.3)),
+            }
+        logger.info("  bref: %d pitchers", len(bref))
+    except Exception as e:
+        logger.warning("pitching_stats_bref(%d) failed: %s", season, e)
+
+    # --- Statcast expected stats (xERA) ---
+    logger.info("Fetching statcast_pitcher_expected_stats(%d)...", season)
+    xera_map: dict[int, float] = {}
+    try:
+        df = pb.statcast_pitcher_expected_stats(season, minPA=20)
+        df["player_id"] = pd.to_numeric(df["player_id"], errors="coerce")
+        df = df.dropna(subset=["player_id"])
+        df["player_id"] = df["player_id"].astype(int)
+        for _, row in df.iterrows():
+            val = row.get("xera")
+            if val is not None:
+                try:
+                    xera_map[int(row["player_id"])] = float(np.clip(val, 0.5, 10.0))
+                except (TypeError, ValueError):
+                    pass
+        logger.info("  xERA: %d pitchers", len(xera_map))
+    except Exception as e:
+        logger.warning("statcast_pitcher_expected_stats(%d) failed: %s", season, e)
+
+    # --- Statcast exit velo / barrel / hard-hit ---
+    logger.info("Fetching statcast_pitcher_exitvelo_barrels(%d)...", season)
+    contact_map: dict[int, dict] = {}
+    try:
+        df = pb.statcast_pitcher_exitvelo_barrels(season, minBBE=20)
+        df["player_id"] = pd.to_numeric(df["player_id"], errors="coerce")
+        df = df.dropna(subset=["player_id"])
+        df["player_id"] = df["player_id"].astype(int)
+        for _, row in df.iterrows():
+            def _g(col, fallback):
+                v = row.get(col)
+                try: return float(v) if v is not None else fallback
+                except: return fallback
+
+            brl = _g("brl_percent", LEAGUE_AVG["sp_barrel"] * 100) / 100.0
+            hh  = _g("ev95percent", LEAGUE_AVG["sp_hh_pct"] * 100) / 100.0
+            ev  = _g("avg_hit_speed", LEAGUE_AVG["sp_exit_velo"])
+            if brl > 1.0: brl /= 100.0
+            if hh  > 1.0: hh  /= 100.0
+            contact_map[int(row["player_id"])] = {
+                "barrel_pct": brl, "hh_pct": hh, "avg_exit_velo": ev
+            }
+        logger.info("  contact: %d pitchers", len(contact_map))
+    except Exception as e:
+        logger.warning("statcast_pitcher_exitvelo_barrels(%d) failed: %s", season, e)
+
+    # --- Statcast fastball spin ---
+    logger.info("Fetching statcast_pitcher_pitch_arsenal(%d, avg_spin)...", season)
+    spin_map: dict[int, float] = {}
+    try:
+        df = pb.statcast_pitcher_pitch_arsenal(season, minP=50, arsenal_type="avg_spin")
+        df["pitcher"] = pd.to_numeric(df["pitcher"], errors="coerce")
+        df = df.dropna(subset=["pitcher"])
+        df["pitcher"] = df["pitcher"].astype(int)
+        spin_cols = [c for c in ["ff_avg_spin","si_avg_spin","fc_avg_spin"] if c in df.columns]
+        if spin_cols:
+            df["best_spin"] = df[spin_cols].bfill(axis=1).iloc[:, 0]
+            for _, row in df.iterrows():
+                v = row.get("best_spin")
+                if v is not None and not (isinstance(v, float) and np.isnan(v)):
+                    spin_map[int(row["pitcher"])] = float(np.clip(v, 1500, 3500))
+        logger.info("  spin: %d pitchers", len(spin_map))
+    except Exception as e:
+        logger.warning("statcast_pitcher_pitch_arsenal(%d) failed: %s", season, e)
+
+    # --- Merge all tables by MLBAM ID ---
+    all_ids = set(bref) | set(xera_map) | set(contact_map) | set(spin_map)
+    result: dict[int, dict] = {}
+    for pid in all_ids:
+        b = bref.get(pid, {})
+        c = contact_map.get(pid, {})
+        fip = b.get("fip", LEAGUE_AVG["sp_fip"])
+        result[pid] = {
+            "xera":          xera_map.get(pid, LEAGUE_AVG["sp_xera"]),
+            "fip":           fip,
+            "xfip":          fip,   # proxy
+            "siera":         fip,   # proxy
+            "k_pct":         b.get("k_pct",  LEAGUE_AVG["sp_k_pct"]),
+            "bb_pct":        b.get("bb_pct", LEAGUE_AVG["sp_bb_pct"]),
+            "barrel_pct":    c.get("barrel_pct",    LEAGUE_AVG["sp_barrel"]),
+            "hh_pct":        c.get("hh_pct",        LEAGUE_AVG["sp_hh_pct"]),
+            "avg_exit_velo": c.get("avg_exit_velo", LEAGUE_AVG["sp_exit_velo"]),
+            "fastball_spin": spin_map.get(pid, LEAGUE_AVG["sp_spin"]),
+        }
+
+    logger.info("  -> %d pitchers merged for season %d", len(result), season)
+    _save(f"pitcher_merged_{season}", {str(k): v for k, v in result.items()})
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 3. Team batting stats (MLB Stats API)
+# ---------------------------------------------------------------------------
+
+def fetch_team_batting(season: int) -> dict[str, dict]:
+    cached = _load(f"team_batting_mlb_{season}")
+    if cached:
+        logger.info("Team batting cache hit for %d", season)
+        return cached
+
+    logger.info("Fetching team batting from MLB Stats API for %d...", season)
+
+    # Get all team IDs
+    try:
+        data = _mlb_get("/teams", params={"sportId": 1, "season": season})
+        teams = {t["abbreviation"]: t["id"] for t in data.get("teams", [])}
+    except Exception as e:
+        logger.warning("team list failed: %s", e)
+        return {}
+
+    result: dict[str, dict] = {}
+    for abbr, tid in teams.items():
+        try:
+            data = _mlb_get(f"/teams/{tid}/stats",
+                            params={"season": season, "group": "hitting", "stats": "season"})
+            stats = data.get("stats", [{}])[0].get("splits", [{}])
+            s = stats[0].get("stat", {}) if stats else {}
+            def _f(k, fb):
+                v = s.get(k)
+                try: return float(v) if v is not None else fb
+                except: return fb
+            obp = _f("obp", 0.320)
+            slg = _f("slg", 0.400)
+            result[abbr] = {
+                "woba": obp,
+                "ops":  round(obp + slg, 4),
+                "avg":  _f("avg", 0.250),
+            }
+            time.sleep(0.05)
+        except Exception as e:
+            logger.debug("team batting failed for %s: %s", abbr, e)
+
+    logger.info("  -> %d teams for %d", len(result), season)
+    _save(f"team_batting_mlb_{season}", result)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 4. Player name lookup
+# ---------------------------------------------------------------------------
+
+_name_cache: dict[int, str] = {}
+
+def resolve_name(mlbam_id: int) -> str | None:
+    if mlbam_id in _name_cache:
+        return _name_cache[mlbam_id]
+    try:
+        d = _mlb_get(f"/people/{mlbam_id}")
+        name = d["people"][0]["fullName"]
+        _name_cache[mlbam_id] = name
+        return name
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# 5. Feature row builder
+# ---------------------------------------------------------------------------
+
+def _sp(pitcher_id: int | None, pitchers: dict) -> dict:
+    if pitcher_id and pitcher_id in pitchers:
+        return pitchers[pitcher_id]
+    return {
+        "xera": LEAGUE_AVG["sp_xera"], "fip": LEAGUE_AVG["sp_fip"],
+        "xfip": LEAGUE_AVG["sp_xfip"], "siera": LEAGUE_AVG["sp_siera"],
+        "k_pct": LEAGUE_AVG["sp_k_pct"], "bb_pct": LEAGUE_AVG["sp_bb_pct"],
+        "barrel_pct": LEAGUE_AVG["sp_barrel"], "hh_pct": LEAGUE_AVG["sp_hh_pct"],
+        "avg_exit_velo": LEAGUE_AVG["sp_exit_velo"], "fastball_spin": LEAGUE_AVG["sp_spin"],
+    }
+
+def _team(abbr: str, batting: dict) -> dict:
+    s = batting.get(abbr, {})
+    if not s:
+        for k, v in batting.items():
+            if k.upper() == abbr.upper():
+                s = v
+                break
+    return {
+        "woba": s.get("woba", LEAGUE_AVG["lineup_woba"]),
+        "ops":  s.get("ops",  LEAGUE_AVG["ops_14d"]),
+        "avg":  s.get("avg",  LEAGUE_AVG["risp_14d"]),
+    }
+
+def _pf(home_team: str) -> dict:
+    hc = PARK_FACTORS_HARDCODED.get(home_team.upper(), {})
+    return {
+        "runs": hc.get("runs", LEAGUE_AVG["park_factor_runs"]),
+        "hr":   hc.get("hr",   LEAGUE_AVG["park_factor_hr"]),
+    }
+
+def build_feature_row(game: dict, pitchers: dict, batting: dict) -> dict:
+    home_sp = _sp(game.get("home_sp_id"), pitchers)
+    away_sp = _sp(game.get("away_sp_id"), pitchers)
+    home_b  = _team(game["home_team"], batting)
+    away_b  = _team(game["away_team"], batting)
+    pf      = _pf(game["home_team"])
+
+    def _fip_bp(sp_stats):
+        """Bullpen xERA proxy: SP xFIP * 1.05 (bullpen ERA typically slightly higher)."""
+        return min(sp_stats.get("xfip", LEAGUE_AVG["sp_xfip"]) * 1.05, 7.0)
+
+    return {
+        "game_id":   game["game_id"],
+        "game_date": game["game_date"],
+        "cycle":     "A",
+        "home_team": game["home_team"],
+        "away_team": game["away_team"],
+        # Home SP
+        "home_sp_xera":          home_sp["xera"],
+        "home_sp_fip":           home_sp["fip"],
+        "home_sp_xfip":          home_sp["xfip"],
+        "home_sp_siera":         home_sp["siera"],
+        "home_sp_k_pct":         home_sp["k_pct"],
+        "home_sp_bb_pct":        home_sp["bb_pct"],
+        "home_sp_barrel":        home_sp["barrel_pct"],
+        "home_sp_hh_pct":        home_sp["hh_pct"],
+        "home_sp_exit_velo":     home_sp["avg_exit_velo"],
+        "home_sp_spin":          home_sp["fastball_spin"],
+        "home_sp_days_rest":     int(LEAGUE_AVG["sp_days_rest"]),
+        "home_sp_hand_match_pct":LEAGUE_AVG["sp_hand_match_pct"],
+        "home_sp_bvp_woba":      LEAGUE_AVG["sp_bvp_woba"],
+        # Away SP
+        "away_sp_xera":          away_sp["xera"],
+        "away_sp_fip":           away_sp["fip"],
+        "away_sp_xfip":          away_sp["xfip"],
+        "away_sp_siera":         away_sp["siera"],
+        "away_sp_k_pct":         away_sp["k_pct"],
+        "away_sp_bb_pct":        away_sp["bb_pct"],
+        "away_sp_barrel":        away_sp["barrel_pct"],
+        "away_sp_hh_pct":        away_sp["hh_pct"],
+        "away_sp_exit_velo":     away_sp["avg_exit_velo"],
+        "away_sp_spin":          away_sp["fastball_spin"],
+        "away_sp_days_rest":     int(LEAGUE_AVG["sp_days_rest"]),
+        "away_sp_hand_match_pct":LEAGUE_AVG["sp_hand_match_pct"],
+        "away_sp_bvp_woba":      LEAGUE_AVG["sp_bvp_woba"],
+        # Home BP
+        "home_bp_xera":   _fip_bp(home_sp),
+        "home_bp_ip_3d":  LEAGUE_AVG["bp_ip_3d"],
+        "home_bp_li":     LEAGUE_AVG["bp_li"],
+        "home_bp_il_ct":  int(LEAGUE_AVG["bp_il_ct"]),
+        # Away BP
+        "away_bp_xera":   _fip_bp(away_sp),
+        "away_bp_ip_3d":  LEAGUE_AVG["bp_ip_3d"],
+        "away_bp_li":     LEAGUE_AVG["bp_li"],
+        "away_bp_il_ct":  int(LEAGUE_AVG["bp_il_ct"]),
+        # Home lineup
+        "home_lineup_woba": home_b["woba"],
+        "home_ops_14d":     home_b["ops"],
+        "home_risp_14d":    home_b["avg"],
+        "home_starters_il": int(LEAGUE_AVG["starters_il"]),
+        "home_run_diff":    LEAGUE_AVG["run_diff"],
+        # Away lineup
+        "away_lineup_woba": away_b["woba"],
+        "away_ops_14d":     away_b["ops"],
+        "away_risp_14d":    away_b["avg"],
+        "away_starters_il": int(LEAGUE_AVG["starters_il"]),
+        "away_run_diff":    LEAGUE_AVG["run_diff"],
+        # Park / weather
+        "park_factor_runs": pf["runs"],
+        "park_factor_hr":   pf["hr"],
+        "wind_speed":       LEAGUE_AVG["wind_speed"],
+        "wind_dir_deg":     LEAGUE_AVG["wind_dir_deg"],
+        "temperature":      LEAGUE_AVG["temperature"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="Build MLB historical training data (v2)")
+    parser.add_argument("--seasons", default="2022,2023,2024",
+                        help="Comma-separated list of game seasons (default: 2022,2023,2024)")
+    args = parser.parse_args()
+    seasons = [int(s.strip()) for s in args.seasons.split(",")]
+
+    all_rows: list[dict] = []
+    all_results: list[dict] = []
+
+    for season in seasons:
+        prev = season - 1
+        logger.info("=== Season %d (pitcher stats from %d) ===", season, prev)
+
+        pitchers = fetch_pitcher_tables(prev)
+        batting  = fetch_team_batting(prev)
+        games    = fetch_season_schedule(season)
+
+        if not games:
+            logger.warning("No games for %d; skipping", season)
+            continue
+
+        # Batch-resolve names to warm name cache (avoids per-game API calls)
+        ids_needed = {int(g[k]) for g in games for k in ("home_sp_id","away_sp_id") if g.get(k)}
+        ids_missing = ids_needed - set(pitchers.keys())
+        if ids_missing:
+            logger.info("Resolving %d pitcher names not in stat table...", len(ids_missing))
+            for pid in ids_missing:
+                resolve_name(pid)
+
+        for game in games:
+            row = build_feature_row(game, pitchers, batting)
+            all_rows.append(row)
+            hs, as_ = game["home_score"], game["away_score"]
+            all_results.append({
+                "game_id":    game["game_id"],
+                "game_date":  game["game_date"],
+                "home_team":  game["home_team"],
+                "away_team":  game["away_team"],
+                "home_score": hs,
+                "away_score": as_,
+                "winner":     game["home_team"] if hs > as_ else game["away_team"],
+                "total_runs": hs + as_,
+            })
+
+        logger.info("Season %d: %d rows built", season, len(games))
+
+    if not all_rows:
+        logger.error("No data collected.")
+        sys.exit(1)
+
+    features_df = pd.DataFrame(all_rows)
+    results_df  = pd.DataFrame(all_results)
+
+    for c in FEATURE_COLUMNS:
+        if c not in features_df.columns:
+            logger.warning("Missing column %s — filling 0", c)
+            features_df[c] = 0.0
+
+    feat_path   = DATA_DIR / "historical_features.parquet"
+    result_path = DATA_DIR / "historical_results.csv"
+    features_df.to_parquet(feat_path, index=False)
+    results_df.to_csv(result_path, index=False)
+
+    logger.info("Saved %d feature rows  -> %s", len(features_df), feat_path)
+    logger.info("Saved %d result rows   -> %s", len(results_df),  result_path)
+
+    # Coverage report
+    n = len(features_df)
+    for col in FEATURE_COLUMNS:
+        la_val = None
+        for k, v in LEAGUE_AVG.items():
+            if col.endswith(k):
+                la_val = v
+                break
+        if la_val is not None:
+            imputed = (features_df[col] == la_val).sum()
+            if imputed / n > 0.8:
+                logger.warning("  %s: %.0f%% at league-average (low signal)", col, imputed/n*100)
+
+    logger.info("")
+    logger.info("Next step:  python model/train.py")
+
+
+if __name__ == "__main__":
+    main()

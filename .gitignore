@@ -1,0 +1,27 @@
+# Database
+*.duckdb
+*.duckdb.wal
+
+# Model artifacts (large binary files)
+models/
+
+# Training data
+data/
+
+# Logs
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Credentials / secrets
+.env
+*.env
+.mlb_env
+
+# pybaseball cache
+.pybaseball/
