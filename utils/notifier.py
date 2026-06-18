@@ -102,6 +102,18 @@ def _label_row(text: str) -> str:
 # Summary predictions table (quick-scan header)
 # ---------------------------------------------------------------------------
 
+_OU_LINE = 9.0  # default over/under reference line when no odds are available
+
+
+def _ou_label(predicted_total: float) -> tuple:
+    """Return (direction, confidence_pct) for over/under prediction."""
+    diff = predicted_total - _OU_LINE
+    # Confidence scales with distance from line; ±3 runs → ~100%
+    conf = min(50 + abs(diff) / 3.0 * 50, 99)
+    direction = "Over" if diff >= 0 else "Under"
+    return direction, round(conf, 1)
+
+
 def _predictions_table(date_str: str, cycle: str) -> str:
     try:
         conn = duckdb.connect(DB_PATH, read_only=True)
@@ -111,8 +123,9 @@ def _predictions_table(date_str: str, cycle: str) -> str:
                 CASE WHEN p.home_win_prob >= 0.5
                      THEN f.home_team ELSE f.away_team END    AS pick,
                 ROUND(GREATEST(p.home_win_prob,
-                               p.away_win_prob) * 100, 1)    AS confidence,
-                ROUND(p.predicted_total, 1)                   AS total
+                               p.away_win_prob) * 100, 1)    AS win_conf,
+                ROUND(p.predicted_total, 1)                   AS total,
+                p.home_win_prob
             FROM predictions p
             JOIN features f ON p.game_id = f.game_id AND p.cycle = f.cycle
             WHERE f.game_date = ? AND p.cycle = ?
@@ -126,28 +139,38 @@ def _predictions_table(date_str: str, cycle: str) -> str:
     if not rows:
         return "<p>No predictions available.</p>"
 
-    rows_html = "".join(
-        f"<tr style='background:{'#f5f5f5' if i % 2 else '#fff'}'>"
-        f"<td style='padding:6px 10px'>{r[0]}</td>"
-        f"<td style='padding:6px 10px;font-weight:bold'>{r[1]}</td>"
-        f"<td style='padding:6px 10px'>{r[2]}%</td>"
-        f"<td style='padding:6px 10px'>{r[3]}</td>"
-        f"</tr>"
-        for i, r in enumerate(rows)
-    )
+    rows_html = ""
+    for i, r in enumerate(rows):
+        matchup, pick, win_conf, total, home_prob = r
+        ou_dir, ou_conf = _ou_label(total)
+        bg = "#f5f5f5" if i % 2 else "#fff"
+        win_color = "#2e7d32" if win_conf >= 65 else ("#e65100" if win_conf >= 55 else "#555")
+        ou_color  = "#1565c0" if ou_dir == "Over" else "#6a1b9a"
+        rows_html += (
+            f"<tr style='background:{bg}'>"
+            f"<td style='padding:6px 10px'>{matchup}</td>"
+            f"<td style='padding:6px 10px;font-weight:bold'>{pick}</td>"
+            f"<td style='padding:6px 10px;color:{win_color};font-weight:bold'>{win_conf}%</td>"
+            f"<td style='padding:6px 10px;color:{ou_color};font-weight:bold'>{ou_dir} ({total})</td>"
+            f"<td style='padding:6px 10px;color:{ou_color}'>{ou_conf}%</td>"
+            f"</tr>"
+        )
+
     return f"""
 <table border="0" cellspacing="0" cellpadding="0"
        style="border-collapse:collapse;width:100%;border:1px solid #ddd">
   <thead style="background:#1a237e;color:#fff">
     <tr>
       <th style="padding:8px 10px;text-align:left">Matchup</th>
-      <th style="padding:8px 10px;text-align:left">Pick</th>
-      <th style="padding:8px 10px;text-align:left">Confidence</th>
-      <th style="padding:8px 10px;text-align:left">Pred Total</th>
+      <th style="padding:8px 10px;text-align:left">Result Pick</th>
+      <th style="padding:8px 10px;text-align:left">Win %</th>
+      <th style="padding:8px 10px;text-align:left">O/U (pred total)</th>
+      <th style="padding:8px 10px;text-align:left">O/U %</th>
     </tr>
   </thead>
   <tbody>{rows_html}</tbody>
-</table>"""
+</table>
+<p style="font-size:11px;color:#888;margin-top:4px">O/U reference line: {_OU_LINE} runs. O/U % = model confidence based on distance from line.</p>"""
 
 
 # ---------------------------------------------------------------------------
@@ -276,6 +299,7 @@ def _build_game_brief_cards(date_str: str) -> str:
         pick       = home_team if home_win_prob >= 0.5 else away_team
         conf       = max(home_win_prob, 1 - home_win_prob) * 100
         conf_color = "#2e7d32" if conf >= 65 else ("#e65100" if conf >= 55 else "#555")
+        ou_dir, ou_conf = _ou_label(pred_total)
 
         # Pitcher info
         sched = schedule_idx.get(str(game_id), {})
@@ -326,7 +350,9 @@ def _build_game_brief_cards(date_str: str) -> str:
     <td style="padding:9px 13px;text-align:right;white-space:nowrap">
       PICK: <b style="color:#fff176">{pick}</b>
       &nbsp;<span style="color:{conf_color};background:#fff;border-radius:3px;padding:1px 7px;font-size:13px">{conf:.1f}%</span>
-      &nbsp;&nbsp;O/U: <b>{pred_total:.1f}</b>
+      &nbsp;&nbsp;|&nbsp;&nbsp;
+      <b style="color:#fff176">{ou_dir}</b> {pred_total:.1f}
+      &nbsp;<span style="background:#fff;border-radius:3px;padding:1px 7px;font-size:13px;color:#555">{ou_conf:.0f}%</span>
     </td>
   </tr>
   {_label_row("Starting Pitchers")}

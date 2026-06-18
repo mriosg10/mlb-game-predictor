@@ -54,7 +54,8 @@ def _fetch_open_meteo(lat: float, lon: float, target_date: date) -> dict:
         "timezone": "America/New_York",
         "start_date": target_date.strftime("%Y-%m-%d"),
         "end_date":   target_date.strftime("%Y-%m-%d"),
-        "forecast_days": 1,
+        # Note: do NOT include forecast_days when start_date/end_date are set —
+        # they are mutually exclusive in the Open-Meteo API (causes HTTP 400).
     }
     resp = requests.get(OPEN_METEO_BASE, params=params, timeout=HTTP_TIMEOUT)
     resp.raise_for_status()

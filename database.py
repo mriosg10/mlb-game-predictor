@@ -147,9 +147,14 @@ def get_conn():
     try:
         yield conn
         conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
+    except Exception as original_exc:
+        try:
+            conn.rollback()
+        except Exception as rb_exc:
+            # DuckDB autocommit mode raises this when rollback is called with
+            # no active transaction — safe to ignore, re-raise the original.
+            logger.debug("rollback skipped (autocommit): %s", rb_exc)
+        raise original_exc
     finally:
         conn.close()
 
@@ -183,6 +188,8 @@ def init_db() -> None:
 
 def upsert_features(row: dict[str, Any]) -> None:
     """Insert or replace a feature row (keyed on game_id + cycle)."""
+    # Strip private metadata keys (prefixed with _) — they're not DB columns.
+    row = {k: v for k, v in row.items() if not k.startswith("_")}
     row.setdefault("created_at", datetime.now(timezone.utc))
     cols = ", ".join(row.keys())
     placeholders = ", ".join(f"${i+1}" for i in range(len(row)))
