@@ -102,16 +102,24 @@ def _label_row(text: str) -> str:
 # Summary predictions table (quick-scan header)
 # ---------------------------------------------------------------------------
 
-_OU_LINE = 9.0  # default over/under reference line when no odds are available
-
-
-def _ou_label(predicted_total: float) -> tuple:
-    """Return (direction, confidence_pct) for over/under prediction."""
-    diff = predicted_total - _OU_LINE
-    # Confidence scales with distance from line; ±3 runs → ~100%
+def _ou_display(
+    ou_prob: float | None,
+    ou_line: float | None,
+    predicted_total: float,
+) -> tuple:
+    """
+    Return (direction, line_str, conf_pct) for over/under display.
+    Uses real sportsbook line and calibrated probability when available;
+    falls back to synthetic formula (fixed 9.0 line) otherwise.
+    """
+    if ou_line is not None and ou_prob is not None:
+        direction = "Over" if ou_prob >= 0.5 else "Under"
+        conf = round((ou_prob if ou_prob >= 0.5 else 1.0 - ou_prob) * 100, 1)
+        return direction, f"{ou_line:.1f}", conf
+    # Synthetic fallback when odds API is unavailable
+    diff = predicted_total - 9.0
     conf = min(50 + abs(diff) / 3.0 * 50, 99)
-    direction = "Over" if diff >= 0 else "Under"
-    return direction, round(conf, 1)
+    return ("Over" if diff >= 0 else "Under"), "9.0*", round(conf, 1)
 
 
 def _predictions_table(date_str: str, cycle: str) -> str:
@@ -125,7 +133,9 @@ def _predictions_table(date_str: str, cycle: str) -> str:
                 ROUND(GREATEST(p.home_win_prob,
                                p.away_win_prob) * 100, 1)    AS win_conf,
                 ROUND(p.predicted_total, 1)                   AS total,
-                p.home_win_prob
+                p.home_win_prob,
+                p.ou_prob,
+                p.ou_line
             FROM predictions p
             JOIN features f ON p.game_id = f.game_id AND p.cycle = f.cycle
             WHERE f.game_date = ? AND p.cycle = ?
@@ -139,10 +149,11 @@ def _predictions_table(date_str: str, cycle: str) -> str:
     if not rows:
         return "<p>No predictions available.</p>"
 
+    has_real_lines = any(r[6] is not None for r in rows)
     rows_html = ""
     for i, r in enumerate(rows):
-        matchup, pick, win_conf, total, home_prob = r
-        ou_dir, ou_conf = _ou_label(total)
+        matchup, pick, win_conf, total, home_prob, ou_prob, ou_line = r
+        ou_dir, line_str, ou_conf = _ou_display(ou_prob, ou_line, total)
         bg = "#f5f5f5" if i % 2 else "#fff"
         win_color = "#2e7d32" if win_conf >= 65 else ("#e65100" if win_conf >= 55 else "#555")
         ou_color  = "#1565c0" if ou_dir == "Over" else "#6a1b9a"
@@ -151,10 +162,19 @@ def _predictions_table(date_str: str, cycle: str) -> str:
             f"<td style='padding:6px 10px'>{matchup}</td>"
             f"<td style='padding:6px 10px;font-weight:bold'>{pick}</td>"
             f"<td style='padding:6px 10px;color:{win_color};font-weight:bold'>{win_conf}%</td>"
-            f"<td style='padding:6px 10px;color:{ou_color};font-weight:bold'>{ou_dir} ({total})</td>"
+            f"<td style='padding:6px 10px;color:{ou_color};font-weight:bold'>"
+            f"{ou_dir} &nbsp;<span style='font-weight:normal;font-size:12px'>pred {total} / line {line_str}</span></td>"
             f"<td style='padding:6px 10px;color:{ou_color}'>{ou_conf}%</td>"
             f"</tr>"
         )
+
+    footnote = (
+        '<p style="font-size:11px;color:#888;margin-top:4px">O/U line from The Odds API (consensus). '
+        'O/U % = calibrated model probability.</p>'
+        if has_real_lines else
+        '<p style="font-size:11px;color:#888;margin-top:4px">* No odds line available — O/U uses '
+        'synthetic formula (9.0 fixed reference). Set MLB_ODDS_API_KEY to enable real lines.</p>'
+    )
 
     return f"""
 <table border="0" cellspacing="0" cellpadding="0"
@@ -164,13 +184,13 @@ def _predictions_table(date_str: str, cycle: str) -> str:
       <th style="padding:8px 10px;text-align:left">Matchup</th>
       <th style="padding:8px 10px;text-align:left">Result Pick</th>
       <th style="padding:8px 10px;text-align:left">Win %</th>
-      <th style="padding:8px 10px;text-align:left">O/U (pred total)</th>
+      <th style="padding:8px 10px;text-align:left">O/U (pred / line)</th>
       <th style="padding:8px 10px;text-align:left">O/U %</th>
     </tr>
   </thead>
   <tbody>{rows_html}</tbody>
 </table>
-<p style="font-size:11px;color:#888;margin-top:4px">O/U reference line: {_OU_LINE} runs. O/U % = model confidence based on distance from line.</p>"""
+{footnote}"""
 
 
 # ---------------------------------------------------------------------------
@@ -249,7 +269,8 @@ def _build_game_brief_cards(date_str: str) -> str:
                 COALESCE(f.home_run_diff, 0),
                 COALESCE(f.away_ops_14d, 0), COALESCE(f.away_risp_14d, 0),
                 COALESCE(f.away_run_diff, 0),
-                p.home_win_prob, p.predicted_total
+                p.home_win_prob, p.predicted_total,
+                p.ou_prob, p.ou_line
             FROM features f
             JOIN predictions p ON f.game_id = p.game_id AND f.cycle = p.cycle
             WHERE f.game_date = ? AND f.cycle = 'A'
@@ -294,12 +315,13 @@ def _build_game_brief_cards(date_str: str) -> str:
          a_xera, a_fip, a_k, a_bb, a_era_l3, a_whip_l3,
          h_ops, h_risp, h_rdiff,
          a_ops, a_risp, a_rdiff,
-         home_win_prob, pred_total) = row
+         home_win_prob, pred_total,
+         ou_prob, ou_line) = row
 
         pick       = home_team if home_win_prob >= 0.5 else away_team
         conf       = max(home_win_prob, 1 - home_win_prob) * 100
         conf_color = "#2e7d32" if conf >= 65 else ("#e65100" if conf >= 55 else "#555")
-        ou_dir, ou_conf = _ou_label(pred_total)
+        ou_dir, line_str, ou_conf = _ou_display(ou_prob, ou_line, pred_total)
 
         # Pitcher info
         sched = schedule_idx.get(str(game_id), {})
@@ -351,7 +373,7 @@ def _build_game_brief_cards(date_str: str) -> str:
       PICK: <b style="color:#fff176">{pick}</b>
       &nbsp;<span style="color:{conf_color};background:#fff;border-radius:3px;padding:1px 7px;font-size:13px">{conf:.1f}%</span>
       &nbsp;&nbsp;|&nbsp;&nbsp;
-      <b style="color:#fff176">{ou_dir}</b> {pred_total:.1f}
+      <b style="color:#fff176">{ou_dir}</b> {pred_total:.1f} / {line_str}
       &nbsp;<span style="background:#fff;border-radius:3px;padding:1px 7px;font-size:13px;color:#555">{ou_conf:.0f}%</span>
     </td>
   </tr>
@@ -477,7 +499,9 @@ def notify_post_game(game_date: date, status: dict) -> None:
                            AND r.winner = f.away_team)
                      THEN '&#10003;' ELSE '&#10007;' END      AS correct,
                 ROUND(p.predicted_total, 1)                   AS pred_total,
-                r.total_runs                                  AS actual_total
+                r.total_runs                                  AS actual_total,
+                p.ou_prob,
+                p.ou_line
             FROM predictions p
             JOIN features f ON p.game_id = f.game_id AND p.cycle = f.cycle
             JOIN results  r ON p.game_id = r.game_id
@@ -501,6 +525,34 @@ def notify_post_game(game_date: date, status: dict) -> None:
     correct = sum(1 for r in rows if "10003" in r[4])
     total_g = len(rows)
 
+    # Compute MAE directly from rows (don't rely on eval_log which may be None)
+    mae_vals = [abs((r[5] or 0) - (r[6] or 0)) for r in rows if r[5] is not None and r[6] is not None]
+    mae_computed = round(sum(mae_vals) / len(mae_vals), 2) if mae_vals else None
+
+    # O/U accuracy: only count games where we had a real sportsbook line
+    ou_correct = 0
+    ou_total   = 0
+    for r in rows:
+        ou_prob, ou_line, actual_total = r[7], r[8], r[6]
+        if ou_prob is not None and ou_line is not None and actual_total is not None:
+            ou_total += 1
+            predicted_over = ou_prob >= 0.5
+            actual_over    = actual_total > ou_line
+            if predicted_over == actual_over:
+                ou_correct += 1
+
+    def _ou_result_cell(ou_prob, ou_line, actual_total) -> str:
+        if ou_prob is None or ou_line is None or actual_total is None:
+            return "<span style='color:#aaa'>—</span>"
+        predicted_over = ou_prob >= 0.5
+        actual_over    = actual_total > ou_line
+        direction      = "Over" if predicted_over else "Under"
+        correct_call   = predicted_over == actual_over
+        icon  = "&#10003;" if correct_call else "&#10007;"
+        color = "#2e7d32"  if correct_call else "#c62828"
+        return (f'<span style="color:{color};font-weight:bold">{direction} {icon}</span>'
+                f'<span style="color:#888;font-size:11px"> ({actual_total} vs {ou_line:.1f})</span>')
+
     rows_html = "".join(
         f"<tr style='background:{'#f5f5f5' if i % 2 else '#fff'}'>"
         f"<td style='padding:6px 10px'>{r[0]}</td>"
@@ -509,6 +561,7 @@ def notify_post_game(game_date: date, status: dict) -> None:
         f"<td style='padding:6px 10px;font-weight:bold'>{r[3]}</td>"
         f"<td style='padding:6px 10px;font-size:16px'>{r[4]}</td>"
         f"<td style='padding:6px 10px'>{r[5]} &rarr; {r[6]}</td>"
+        f"<td style='padding:6px 10px'>{_ou_result_cell(r[7], r[8], r[6])}</td>"
         f"</tr>"
         for i, r in enumerate(rows)
     )
@@ -524,22 +577,25 @@ def notify_post_game(game_date: date, status: dict) -> None:
       <th style="padding:8px 10px;text-align:left">Winner</th>
       <th style="padding:8px 10px;text-align:left">Result</th>
       <th style="padding:8px 10px;text-align:left">Total (pred&rarr;actual)</th>
+      <th style="padding:8px 10px;text-align:left">O/U</th>
     </tr>
   </thead>
   <tbody>{rows_html}</tbody>
 </table>""" if rows else "<p>No matched results found.</p>"
 
-    metrics_html = ""
-    if metrics:
-        win_pct = round((metrics["win_acc"] or 0) * 100, 1)
-        metrics_html = f"""
+    win_pct = round(correct / total_g * 100, 1) if total_g else 0
+    ou_pct  = round(ou_correct / ou_total * 100, 1) if ou_total else None
+
+    metrics_html = f"""
 <table style="margin-bottom:16px;border-collapse:collapse">
   <tr><td style="padding:6px 16px 6px 0"><b>Win accuracy</b></td>
       <td>{correct}/{total_g} ({win_pct}%)</td></tr>
+  <tr><td style="padding:6px 16px 6px 0"><b>O/U accuracy</b></td>
+      <td>{"—" if ou_pct is None else f"{ou_correct}/{ou_total} ({ou_pct}%)"}</td></tr>
   <tr><td style="padding:6px 16px 6px 0"><b>Run total MAE</b></td>
-      <td>{round(metrics['mae'] or 0, 2)} runs</td></tr>
+      <td>{"—" if mae_computed is None else f"{mae_computed} runs"}</td></tr>
   <tr><td style="padding:6px 16px 6px 0"><b>Brier score</b></td>
-      <td>{round(metrics['brier'] or 0, 4)}</td></tr>
+      <td>{round(metrics["brier"] or 0, 4) if metrics.get("brier") is not None else "—"}</td></tr>
 </table>"""
 
     failure_html = (f'<p style="color:#c62828"><b>Note:</b> {failure}</p>'
@@ -554,3 +610,81 @@ def notify_post_game(game_date: date, status: dict) -> None:
 """
     _send(f"MLB Post-game — {date_str} ({correct}/{total_g} correct)",
           _html_wrap(f"Post-game Results &middot; {date_str}", body))
+
+
+def notify_retrain(metrics: dict) -> None:
+    """
+    Send a retrain summary email.
+
+    metrics keys:
+      retrain_date  str         e.g. "2026-06-23"
+      model_version str         e.g. "v1.20260623"
+      n_total       int         total games in training set
+      n_live        int         live DB games included
+      win_brier     float       CV Brier score (win model)
+      win_brier_std float
+      win_mae       float       CV MAE (run total model)
+      win_mae_std   float
+      ou_trained    bool        whether OU model was retrained
+      ou_brier      float|None
+      backed_up     list[str]   model filenames that were backed up
+    """
+    date_str      = metrics.get("retrain_date", date.today().isoformat())
+    model_version = metrics.get("model_version", "—")
+    n_total       = metrics.get("n_total", 0)
+    n_live        = metrics.get("n_live",  0)
+    win_brier     = metrics.get("win_brier")
+    win_brier_std = metrics.get("win_brier_std")
+    mae           = metrics.get("win_mae")
+    mae_std       = metrics.get("win_mae_std")
+    ou_trained    = metrics.get("ou_trained", False)
+    ou_brier      = metrics.get("ou_brier")
+    backed_up     = metrics.get("backed_up", [])
+
+    def _fmt(v, std=None, decimals=4):
+        if v is None:
+            return "—"
+        s = f"{v:.{decimals}f}"
+        if std is not None:
+            s += f" ± {std:.{decimals}f}"
+        return s
+
+    backed_html = (
+        "<ul style='margin:4px 0;padding-left:18px'>"
+        + "".join(f"<li style='font-size:12px;color:#555'>{b}</li>" for b in backed_up)
+        + "</ul>"
+    ) if backed_up else "<p style='color:#888;font-size:12px'>none</p>"
+
+    ou_row = (
+        f"<tr><td style='padding:6px 16px 6px 0'><b>O/U model Brier</b></td>"
+        f"<td>{_fmt(ou_brier)}</td></tr>"
+    ) if ou_trained else (
+        "<tr><td style='padding:6px 16px 6px 0'><b>O/U model</b></td>"
+        "<td style='color:#888'>skipped (need ≥ 100 games with ou_line)</td></tr>"
+    )
+
+    body = f"""
+<p>&#128296; Model retrained on <b>{date_str}</b> &nbsp;&middot;&nbsp;
+   version <code>{model_version}</code></p>
+<h3 style="margin-bottom:6px">Training Set</h3>
+<table style="margin-bottom:16px;border-collapse:collapse">
+  <tr><td style="padding:6px 16px 6px 0"><b>Total games</b></td>
+      <td>{n_total:,}</td></tr>
+  <tr><td style="padding:6px 16px 6px 0"><b>Live DB games</b></td>
+      <td>{n_live:,} &nbsp;<span style="color:#888;font-size:12px">(Cycle B + A fallback)</span></td></tr>
+  <tr><td style="padding:6px 16px 6px 0"><b>Historical games</b></td>
+      <td>{n_total - n_live:,}</td></tr>
+</table>
+<h3 style="margin-bottom:6px">CV Metrics (TimeSeriesSplit, 5 folds)</h3>
+<table style="margin-bottom:16px;border-collapse:collapse">
+  <tr><td style="padding:6px 16px 6px 0"><b>Win model Brier</b></td>
+      <td>{_fmt(win_brier, win_brier_std)} &nbsp;<span style="color:#888;font-size:12px">(target &lt; 0.23)</span></td></tr>
+  <tr><td style="padding:6px 16px 6px 0"><b>Run total MAE</b></td>
+      <td>{_fmt(mae, mae_std, decimals=3)} runs &nbsp;<span style="color:#888;font-size:12px">(target &lt; 1.8)</span></td></tr>
+  {ou_row}
+</table>
+<h3 style="margin-bottom:6px">Backed-up Models</h3>
+{backed_html}
+"""
+    _send(f"MLB Retrain — {date_str} ({model_version})",
+          _html_wrap(f"Model Retrain &middot; {date_str}", body))

@@ -102,6 +102,8 @@ CREATE TABLE IF NOT EXISTS predictions (
   home_win_prob    FLOAT,
   away_win_prob    FLOAT,
   predicted_total  FLOAT,
+  ou_prob          FLOAT,
+  ou_line          FLOAT,
   model_version    TEXT,
   created_at       TIMESTAMP DEFAULT now()
 )
@@ -166,6 +168,11 @@ _FEATURES_MIGRATIONS = [
     "ALTER TABLE features ADD COLUMN IF NOT EXISTS away_sp_whip_l3 FLOAT",
 ]
 
+_PREDICTIONS_MIGRATIONS = [
+    "ALTER TABLE predictions ADD COLUMN IF NOT EXISTS ou_prob FLOAT",
+    "ALTER TABLE predictions ADD COLUMN IF NOT EXISTS ou_line FLOAT",
+]
+
 
 def init_db() -> None:
     """Create all tables if they do not exist, and run column migrations."""
@@ -174,7 +181,7 @@ def init_db() -> None:
         conn.execute(_DDL_PREDICTIONS)
         conn.execute(_DDL_RESULTS)
         conn.execute(_DDL_EVALUATION_LOG)
-        for stmt in _FEATURES_MIGRATIONS:
+        for stmt in _FEATURES_MIGRATIONS + _PREDICTIONS_MIGRATIONS:
             try:
                 conn.execute(stmt)
             except Exception:
@@ -208,6 +215,8 @@ def insert_prediction(
     home_win_prob: float,
     predicted_total: float,
     model_version: str,
+    ou_prob: float | None = None,
+    ou_line: float | None = None,
 ) -> str:
     pred_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc)
@@ -217,15 +226,15 @@ def insert_prediction(
     sql_insert = """
         INSERT INTO predictions
           (prediction_id, game_id, cycle, home_win_prob, away_win_prob,
-           predicted_total, model_version, created_at)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+           predicted_total, ou_prob, ou_line, model_version, created_at)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
     """
     with get_conn() as conn:
         conn.execute(sql_delete, [game_id, cycle])
         conn.execute(sql_insert, [
             pred_id, game_id, cycle,
             home_win_prob, round(1.0 - home_win_prob, 6),
-            predicted_total, model_version, now,
+            predicted_total, ou_prob, ou_line, model_version, now,
         ])
     return pred_id
 

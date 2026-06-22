@@ -22,6 +22,7 @@ from typing import Any
 import database as db
 from features.assembler import assemble_game_features
 from fetchers.mlb_stats import get_schedule
+from fetchers.odds import fetch_ou_lines
 from model.inference import ModelNotFoundError, load_models, predict_batch
 from utils.notifier import notify_cycle_a
 
@@ -65,7 +66,7 @@ def run(game_date: date | None = None) -> dict[str, Any]:
             return status
 
         # ------------------------------------------------------------------
-        # Step 2: Fetch schedule
+        # Step 2: Fetch schedule + O/U lines
         # ------------------------------------------------------------------
         games = get_schedule(game_date)
         if not games:
@@ -76,6 +77,15 @@ def run(game_date: date | None = None) -> dict[str, Any]:
             return status
 
         logger.info("Cycle A: %d games to process", len(games))
+
+        # Fetch O/U lines; returns {} if API key not set or call fails
+        raw_ou = fetch_ou_lines(game_date)
+        game_ou_lines: dict[str, float | None] = {
+            str(g["game_id"]): raw_ou.get(f"{g['away_team']}@{g['home_team']}")
+            for g in games
+        }
+        covered = sum(1 for v in game_ou_lines.values() if v is not None)
+        logger.info("Cycle A: O/U lines fetched for %d/%d games", covered, len(games))
 
         # ------------------------------------------------------------------
         # Step 3: Assemble features + run inference
@@ -121,7 +131,7 @@ def run(game_date: date | None = None) -> dict[str, Any]:
         # ------------------------------------------------------------------
         # Step 4: Batch inference
         # ------------------------------------------------------------------
-        predictions = predict_batch(feature_rows, win_model, total_model)
+        predictions = predict_batch(feature_rows, win_model, total_model, ou_lines=game_ou_lines)
 
         # ------------------------------------------------------------------
         # Step 5: Write predictions
@@ -135,6 +145,8 @@ def run(game_date: date | None = None) -> dict[str, Any]:
                     home_win_prob=pred["home_win_prob"],
                     predicted_total=pred["predicted_total"],
                     model_version=pred["model_version"],
+                    ou_prob=pred.get("ou_prob"),
+                    ou_line=pred.get("ou_line"),
                 )
                 written += 1
                 logger.debug(

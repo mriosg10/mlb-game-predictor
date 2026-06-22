@@ -23,7 +23,7 @@ from datetime import date, datetime, timezone
 from typing import Any
 
 import database as db
-from fetchers.mlb_stats import get_final_scores
+from fetchers.mlb_stats import get_final_scores, get_postponed_game_ids
 from pipeline.evaluation import compute_daily_metrics
 from utils.notifier import notify_post_game
 
@@ -80,9 +80,19 @@ def run(game_date: date | None = None) -> dict[str, Any]:
 
         # Check that every game_id in predictions also has a result (AC-03)
         preds_b = db.get_predictions_for_date(date_str, "B")
-        pred_game_ids = {p["game_id"] for p in preds_b}
+        pred_game_ids   = {p["game_id"] for p in preds_b}
         result_game_ids = {s["game_id"] for s in scores}
-        missing_results = pred_game_ids - result_game_ids
+        postponed_ids   = get_postponed_game_ids(game_date)
+
+        # Exclude postponed/cancelled games — they will never produce a result
+        missing_results = pred_game_ids - result_game_ids - postponed_ids
+
+        if postponed_ids & pred_game_ids:
+            logger.info(
+                "Post-game: %d predicted game(s) postponed/cancelled (excluded from AC-03): %s",
+                len(postponed_ids & pred_game_ids),
+                ", ".join(sorted(postponed_ids & pred_game_ids)),
+            )
 
         if missing_results:
             logger.warning(
@@ -137,6 +147,28 @@ def run(game_date: date | None = None) -> dict[str, Any]:
         db.upsert_eval_log(status)
 
     finally:
-        notify_post_game(game_date, status)
+        # Check if a prior run already notified with a SUCCESS for this date.
+        # If so, the retry is silent — don't send a duplicate email.
+        prior_success = False
+        try:
+            with db.get_conn() as conn:
+                row = conn.execute(
+                    "SELECT run_status FROM evaluation_log "
+                    "WHERE log_date = ? AND cycle = 'post' "
+                    "ORDER BY created_at DESC LIMIT 1",
+                    [game_date],
+                ).fetchone()
+                prior_success = row is not None and row[0] == "SUCCESS"
+        except Exception:
+            pass
+
+        db.upsert_eval_log(status)
+
+        if not prior_success:
+            notify_post_game(game_date, status)
+        else:
+            logger.info(
+                "Post-game retry: prior run already succeeded — skipping duplicate email"
+            )
 
     return status

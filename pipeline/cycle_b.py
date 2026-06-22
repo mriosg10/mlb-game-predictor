@@ -27,6 +27,7 @@ from typing import Any
 import database as db
 from features.assembler import assemble_game_features
 from fetchers.mlb_stats import get_player, get_schedule, get_il_transactions
+from fetchers.odds import fetch_ou_lines
 from fetchers.rotowire import ConfirmedLineup, GameLineups, get_confirmed_lineups
 from model.inference import ModelNotFoundError, load_models, predict_batch
 from utils.notifier import notify_cycle_b
@@ -161,6 +162,15 @@ def run(game_date: date | None = None) -> dict[str, Any]:
 
         logger.info("Cycle B: %d games to process", len(games))
 
+        # Fetch O/U lines; returns {} if API key not set or call fails
+        raw_ou = fetch_ou_lines(game_date)
+        game_ou_lines: dict[str, float | None] = {
+            str(g["game_id"]): raw_ou.get(f"{g['away_team']}@{g['home_team']}")
+            for g in games
+        }
+        covered = sum(1 for v in game_ou_lines.values() if v is not None)
+        logger.info("Cycle B: O/U lines fetched for %d/%d games", covered, len(games))
+
         # ------------------------------------------------------------------
         # Step 3: Fetch confirmed lineups from RotoWire
         # ------------------------------------------------------------------
@@ -272,7 +282,7 @@ def run(game_date: date | None = None) -> dict[str, Any]:
         # ------------------------------------------------------------------
         # Step 5: Batch inference + write predictions
         # ------------------------------------------------------------------
-        predictions = predict_batch(feature_rows, win_model, total_model)
+        predictions = predict_batch(feature_rows, win_model, total_model, ou_lines=game_ou_lines)
 
         written = 0
         for pred in predictions:
@@ -283,6 +293,8 @@ def run(game_date: date | None = None) -> dict[str, Any]:
                     home_win_prob=pred["home_win_prob"],
                     predicted_total=pred["predicted_total"],
                     model_version=pred["model_version"],
+                    ou_prob=pred.get("ou_prob"),
+                    ou_line=pred.get("ou_line"),
                 )
                 written += 1
                 logger.debug(

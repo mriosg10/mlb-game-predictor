@@ -17,7 +17,7 @@ import numpy as np
 import pandas as pd
 import xgboost as xgb
 
-from config import FEATURE_COLUMNS, MODEL_VERSION, TOTAL_MODEL_PATH, WIN_MODEL_PATH
+from config import FEATURE_COLUMNS, MODEL_VERSION, OU_FEATURE_COLUMNS, OU_MODEL_PATH, TOTAL_MODEL_PATH, WIN_MODEL_PATH
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +32,57 @@ class ModelNotFoundError(FileNotFoundError):
 
 _win_model:   xgb.Booster | None = None
 _total_model: xgb.Booster | None = None
+_ou_model:    xgb.Booster | None = None
+
+
+def load_ou_model() -> xgb.Booster | None:
+    """
+    Load the OU classifier if the artifact exists. Returns None otherwise,
+    which triggers the logistic fallback in predict_ou_prob().
+    """
+    global _ou_model
+    import os
+    if _ou_model is not None:
+        return _ou_model
+    if not os.path.exists(OU_MODEL_PATH):
+        return None
+    _ou_model = xgb.Booster()
+    _ou_model.load_model(OU_MODEL_PATH)
+    logger.info("OU-prob model loaded: %s", OU_MODEL_PATH)
+    return _ou_model
+
+
+def predict_ou_prob(
+    feature_row: dict[str, Any],
+    predicted_total: float,
+    ou_line: float | None,
+) -> float | None:
+    """
+    Return P(actual_total > ou_line).
+    - Uses XGBoost OU classifier when models/xgb_ou_prob.json exists.
+    - Falls back to a logistic function of (predicted_total - ou_line).
+    - Returns None when ou_line is None (no market line available).
+    """
+    if ou_line is None:
+        return None
+
+    diff = predicted_total - ou_line
+    model = load_ou_model()
+
+    if model is not None:
+        df = pd.DataFrame([{**feature_row, "ou_line": ou_line}])
+        for col in OU_FEATURE_COLUMNS:
+            if col not in df.columns:
+                df[col] = 0.0
+        X = df[OU_FEATURE_COLUMNS].astype(float)
+        X = X.replace([float("inf"), float("-inf")], 0.0).fillna(0.0)
+        dmat = xgb.DMatrix(X, feature_names=OU_FEATURE_COLUMNS)
+        prob = float(model.predict(dmat)[0])
+    else:
+        # Logistic calibration: ±2 runs from the line → ~80% confidence
+        prob = float(1.0 / (1.0 + np.exp(-diff * 0.7)))
+
+    return float(np.clip(prob, 0.05, 0.95))
 
 
 def load_models() -> tuple[xgb.Booster, xgb.Booster]:
@@ -111,10 +162,14 @@ def predict_batch(
     feature_rows: list[dict[str, Any]],
     win_model: xgb.Booster,
     total_model: xgb.Booster,
-) -> list[dict[str, float]]:
+    ou_lines: dict[str, float | None] | None = None,
+) -> list[dict[str, Any]]:
     """
     Run inference for multiple games in one DMatrix call (faster than per-game).
-    Returns a list of {game_id, home_win_prob, predicted_total}.
+    Returns a list of {game_id, home_win_prob, predicted_total, ou_prob, ou_line}.
+
+    ou_lines: optional dict mapping game_id (str) → sportsbook O/U line.
+              Missing or None values result in ou_prob=None.
     """
     if not feature_rows:
         return []
@@ -130,15 +185,21 @@ def predict_batch(
 
     dmatrix = xgb.DMatrix(X, feature_names=FEATURE_COLUMNS)
 
-    win_probs     = win_model.predict(dmatrix)
-    total_preds   = total_model.predict(dmatrix)
+    win_probs   = win_model.predict(dmatrix)
+    total_preds = total_model.predict(dmatrix)
 
     results = []
     for i, row in enumerate(feature_rows):
+        game_id = row["game_id"]
+        pred_total = float(np.clip(total_preds[i], 0.0, 30.0))
+        line = (ou_lines or {}).get(str(game_id))
+        ou_prob = predict_ou_prob(row, pred_total, line)
         results.append({
-            "game_id":        row["game_id"],
-            "home_win_prob":  float(np.clip(win_probs[i],   0.01, 0.99)),
-            "predicted_total":float(np.clip(total_preds[i],  0.0, 30.0)),
-            "model_version":  MODEL_VERSION,
+            "game_id":         game_id,
+            "home_win_prob":   float(np.clip(win_probs[i], 0.01, 0.99)),
+            "predicted_total": pred_total,
+            "ou_prob":         ou_prob,
+            "ou_line":         line,
+            "model_version":   MODEL_VERSION,
         })
     return results

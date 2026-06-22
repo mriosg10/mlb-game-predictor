@@ -238,6 +238,25 @@ def get_final_scores(game_date: date) -> list[dict]:
     return scores
 
 
+def get_postponed_game_ids(game_date: date) -> set[str]:
+    """Return gamePk strings for any game on game_date that is Postponed or Cancelled."""
+    date_str = game_date.strftime("%Y-%m-%d")
+    try:
+        data = _get("/schedule", params={"sportId": 1, "date": date_str})
+    except Exception as exc:
+        logger.warning("postponed game check failed for %s: %s", date_str, exc)
+        return set()
+    postponed = set()
+    for day in data.get("dates", []):
+        for g in day.get("games", []):
+            state = g.get("status", {}).get("detailedState", "")
+            if "Postponed" in state or "Cancelled" in state:
+                postponed.add(str(g["gamePk"]))
+    if postponed:
+        logger.info("Postponed/cancelled games on %s: %s", date_str, ", ".join(sorted(postponed)))
+    return postponed
+
+
 # ---------------------------------------------------------------------------
 # Venue metadata
 # ---------------------------------------------------------------------------

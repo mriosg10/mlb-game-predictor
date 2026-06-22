@@ -17,8 +17,14 @@ LOG_DIR = Path(os.environ.get("MLB_LOG_DIR", str(BASE_DIR / "logs")))
 
 WIN_MODEL_PATH = str(MODEL_DIR / "xgb_win_prob.json")
 TOTAL_MODEL_PATH = str(MODEL_DIR / "xgb_run_total.json")
+OU_MODEL_PATH = str(MODEL_DIR / "xgb_ou_prob.json")
 
-MODEL_VERSION = os.environ.get("MLB_MODEL_VERSION", "v1.0")
+_version_path = MODEL_DIR / "version.txt"
+MODEL_VERSION = (
+    _version_path.read_text().strip()
+    if _version_path.exists()
+    else os.environ.get("MLB_MODEL_VERSION", "v1.0")
+)
 
 # ---------------------------------------------------------------------------
 # External API endpoints
@@ -118,7 +124,7 @@ VENUE_COORDS: dict[str, dict] = {
     "Rogers Centre":              {"lat": 43.6414,  "lon": -79.3894,  "team": "TOR"},
     "Tropicana Field":            {"lat": 27.7682,  "lon": -82.6534,  "team": "TB"},
     "Camden Yards":               {"lat": 39.2838,  "lon": -76.6218,  "team": "BAL"},
-    "Sutter Health Park":         {"lat": 38.5779,  "lon": -121.5005, "team": "OAK"},
+    "Sutter Health Park":         {"lat": 38.5779,  "lon": -121.5005, "team": "ATH"},
 }
 
 # ---------------------------------------------------------------------------
@@ -154,6 +160,8 @@ FEATURE_COLUMNS: list[str] = [
     "park_factor_runs","park_factor_hr",
     "wind_speed",      "wind_dir_deg",     "temperature",
 ]
+
+OU_FEATURE_COLUMNS = FEATURE_COLUMNS + ["ou_line"]  # 54 features for the OU classifier
 
 # ---------------------------------------------------------------------------
 # League-average fallback values
@@ -226,6 +234,7 @@ PARK_FACTORS_HARDCODED: dict[str, dict[str, float]] = {
     "TB":  {"runs":  96.0, "hr":  93.0},
     "MIA": {"runs":  96.0, "hr":  89.0},
     "OAK": {"runs":  95.0, "hr":  88.0},
+    "ATH": {"runs":  96.0, "hr":  90.0},  # Sacramento (Sutter Health Park, est. 2025)
     "SF":  {"runs":  93.0, "hr":  89.0},
     "SD":  {"runs":  93.0, "hr":  89.0},
 }
