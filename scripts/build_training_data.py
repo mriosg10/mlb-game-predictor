@@ -24,7 +24,7 @@ import json
 import logging
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).parent.parent
@@ -34,7 +34,7 @@ import numpy as np
 import pandas as pd
 import requests
 
-from config import FEATURE_COLUMNS, LEAGUE_AVG, PARK_FACTORS_HARDCODED
+from config import FEATURE_COLUMNS, LEAGUE_AVG, PARK_FACTORS_HARDCODED, VENUE_COORDS
 
 logging.basicConfig(
     level=logging.INFO,
@@ -129,10 +129,12 @@ def fetch_season_schedule(season: int) -> list[dict]:
                 away_r = ls.get("away", {}).get("runs")
                 if home_r is None or away_r is None:
                     continue
+                _gdt = g.get("gameDate", "")
                 games.append({
-                    "game_id":      str(g["gamePk"]),
-                    "game_date":    g.get("gameDate", "")[:10],
-                    "season":       season,
+                    "game_id":            str(g["gamePk"]),
+                    "game_date":          _gdt[:10],
+                    "game_time_utc_hour": int(_gdt[11:13]) if len(_gdt) > 13 else 23,
+                    "season":             season,
                     "home_team":    g["teams"]["home"]["team"]["abbreviation"],
                     "away_team":    g["teams"]["away"]["team"]["abbreviation"],
                     "home_team_id": g["teams"]["home"]["team"]["id"],
@@ -402,7 +404,130 @@ def _era_whip_l3(game_logs: dict, pitcher_id, game_date: str, n: int = 3) -> tup
 
 
 # ---------------------------------------------------------------------------
-# 4b. Player name lookup
+# 4b. Days rest — computed from existing game logs
+# ---------------------------------------------------------------------------
+
+def _days_rest(game_logs: dict, pitcher_id, game_date_str: str) -> float:
+    """Actual days since pitcher's last start before game_date (clamped 1-30)."""
+    if not pitcher_id:
+        return float(LEAGUE_AVG["sp_days_rest"])
+    logs = game_logs.get(int(pitcher_id), [])
+    prev = [s["date"] for s in logs if s["date"] < game_date_str]
+    if not prev:
+        return float(LEAGUE_AVG["sp_days_rest"])
+    delta = (datetime.strptime(game_date_str, "%Y-%m-%d") -
+             datetime.strptime(max(prev), "%Y-%m-%d")).days
+    return float(min(max(delta, 1), 30))
+
+
+# ---------------------------------------------------------------------------
+# 4c. Season run differential — computed from schedule results
+# ---------------------------------------------------------------------------
+
+def compute_run_diffs(games: list) -> dict:
+    """
+    For each (team, game_date), returns cumulative season run differential
+    BEFORE that date.  Doubleheader games on the same date both see the
+    pre-day snapshot (snapshot taken before the first game of each day).
+    """
+    sorted_games = sorted(games, key=lambda g: (g["game_date"], g["game_id"]))
+    running: dict[str, float] = {}
+    result: dict[tuple, float] = {}
+    for game in sorted_games:
+        home, away = game["home_team"], game["away_team"]
+        date = game["game_date"]
+        if (home, date) not in result:
+            result[(home, date)] = running.get(home, 0.0)
+        if (away, date) not in result:
+            result[(away, date)] = running.get(away, 0.0)
+        hs, as_ = game["home_score"], game["away_score"]
+        running[home] = running.get(home, 0.0) + (hs - as_)
+        running[away] = running.get(away, 0.0) + (as_ - hs)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 4d. Historical weather — Open-Meteo archive API
+# ---------------------------------------------------------------------------
+
+def fetch_weather_historical(season: int, games: list) -> dict:
+    """
+    Fetches hourly temp + wind for every game via the Open-Meteo historical
+    archive.  Batches by home team (one season-long request per venue, cached).
+    Returns {game_id: {temperature, wind_speed, wind_dir_deg}}.
+    """
+    team_coords: dict[str, dict] = {
+        info["team"]: {"lat": info["lat"], "lon": info["lon"]}
+        for info in VENUE_COORDS.values()
+    }
+
+    from collections import defaultdict
+    games_by_team: dict[str, list] = defaultdict(list)
+    for g in games:
+        games_by_team[g["home_team"]].append(g)
+
+    ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
+    result: dict[str, dict] = {}
+
+    for team, team_games in sorted(games_by_team.items()):
+        coords = team_coords.get(team)
+        if not coords:
+            logger.debug("No venue coords for team %s — weather skipped", team)
+            continue
+
+        cache_key = f"weather_hist_{season}_{team}"
+        cached = _load(cache_key)
+
+        if not cached:
+            logger.info("  weather: %s %d ...", team, season)
+            try:
+                resp = _SESSION.get(ARCHIVE_URL, params={
+                    "latitude":         coords["lat"],
+                    "longitude":        coords["lon"],
+                    "start_date":       f"{season}-03-01",
+                    "end_date":         f"{season}-10-31",
+                    "hourly":           "temperature_2m,windspeed_10m,winddirection_10m",
+                    "timezone":         "UTC",
+                    "temperature_unit": "fahrenheit",
+                    "windspeed_unit":   "mph",
+                }, timeout=30)
+                resp.raise_for_status()
+                h = resp.json().get("hourly", {})
+                cached = {
+                    "time":       h.get("time", []),
+                    "temp":       h.get("temperature_2m", []),
+                    "wind_speed": h.get("windspeed_10m", []),
+                    "wind_dir":   h.get("winddirection_10m", []),
+                }
+                _save(cache_key, cached)
+                time.sleep(0.3)
+            except Exception as exc:
+                logger.warning("  weather failed for %s %d: %s", team, season, exc)
+                cached = None
+
+        if cached and cached.get("time"):
+            t2i = {t: i for i, t in enumerate(cached["time"])}
+            for game in team_games:
+                hour = game.get("game_time_utc_hour", 23)
+                key = f"{game['game_date']}T{hour:02d}:00"
+                idx = t2i.get(key)
+                if idx is not None:
+                    def _safe(lst, i, fb):
+                        v = lst[i] if i < len(lst) else None
+                        return float(v) if v is not None else fb
+                    result[game["game_id"]] = {
+                        "temperature":  _safe(cached["temp"],       idx, LEAGUE_AVG["temperature"]),
+                        "wind_speed":   _safe(cached["wind_speed"], idx, LEAGUE_AVG["wind_speed"]),
+                        "wind_dir_deg": _safe(cached["wind_dir"],   idx, LEAGUE_AVG["wind_dir_deg"]),
+                    }
+
+    logger.info("Weather resolved for %d/%d games in season %d",
+                len(result), len(games), season)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 4e. Player name lookup
 # ---------------------------------------------------------------------------
 
 _name_cache: dict[int, str] = {}
@@ -454,7 +579,8 @@ def _pf(home_team: str) -> dict:
         "hr":   hc.get("hr",   LEAGUE_AVG["park_factor_hr"]),
     }
 
-def build_feature_row(game: dict, pitchers: dict, batting: dict, game_logs: dict) -> dict:
+def build_feature_row(game: dict, pitchers: dict, batting: dict, game_logs: dict,
+                      run_diffs: dict = None, weather_map: dict = None) -> dict:
     home_sp = _sp(game.get("home_sp_id"), pitchers)
     away_sp = _sp(game.get("away_sp_id"), pitchers)
     home_b  = _team(game["home_team"], batting)
@@ -463,6 +589,14 @@ def build_feature_row(game: dict, pitchers: dict, batting: dict, game_logs: dict
 
     h_era_l3, h_whip_l3 = _era_whip_l3(game_logs, game.get("home_sp_id"), game["game_date"])
     a_era_l3, a_whip_l3 = _era_whip_l3(game_logs, game.get("away_sp_id"), game["game_date"])
+
+    # Previously constant features — now populated when data is available
+    date = game["game_date"]
+    home_dr  = _days_rest(game_logs, game.get("home_sp_id"), date)
+    away_dr  = _days_rest(game_logs, game.get("away_sp_id"), date)
+    home_rd  = run_diffs.get((game["home_team"], date), LEAGUE_AVG["run_diff"]) if run_diffs else LEAGUE_AVG["run_diff"]
+    away_rd  = run_diffs.get((game["away_team"], date), LEAGUE_AVG["run_diff"]) if run_diffs else LEAGUE_AVG["run_diff"]
+    wx       = weather_map.get(game["game_id"], {}) if weather_map else {}
 
     def _fip_bp(sp_stats):
         """Bullpen xERA proxy: SP xFIP * 1.05 (bullpen ERA typically slightly higher)."""
@@ -485,7 +619,7 @@ def build_feature_row(game: dict, pitchers: dict, batting: dict, game_logs: dict
         "home_sp_hh_pct":        home_sp["hh_pct"],
         "home_sp_exit_velo":     home_sp["avg_exit_velo"],
         "home_sp_spin":          home_sp["fastball_spin"],
-        "home_sp_days_rest":     int(LEAGUE_AVG["sp_days_rest"]),
+        "home_sp_days_rest":     int(home_dr),
         "home_sp_hand_match_pct":LEAGUE_AVG["sp_hand_match_pct"],
         "home_sp_bvp_woba":      LEAGUE_AVG["sp_bvp_woba"],
         "home_sp_era_l3":        h_era_l3,
@@ -501,7 +635,7 @@ def build_feature_row(game: dict, pitchers: dict, batting: dict, game_logs: dict
         "away_sp_hh_pct":        away_sp["hh_pct"],
         "away_sp_exit_velo":     away_sp["avg_exit_velo"],
         "away_sp_spin":          away_sp["fastball_spin"],
-        "away_sp_days_rest":     int(LEAGUE_AVG["sp_days_rest"]),
+        "away_sp_days_rest":     int(away_dr),
         "away_sp_hand_match_pct":LEAGUE_AVG["sp_hand_match_pct"],
         "away_sp_bvp_woba":      LEAGUE_AVG["sp_bvp_woba"],
         "away_sp_era_l3":        a_era_l3,
@@ -521,19 +655,19 @@ def build_feature_row(game: dict, pitchers: dict, batting: dict, game_logs: dict
         "home_ops_14d":     home_b["ops"],
         "home_risp_14d":    home_b["avg"],
         "home_starters_il": int(LEAGUE_AVG["starters_il"]),
-        "home_run_diff":    LEAGUE_AVG["run_diff"],
+        "home_run_diff":    home_rd,
         # Away lineup
         "away_lineup_woba": away_b["woba"],
         "away_ops_14d":     away_b["ops"],
         "away_risp_14d":    away_b["avg"],
         "away_starters_il": int(LEAGUE_AVG["starters_il"]),
-        "away_run_diff":    LEAGUE_AVG["run_diff"],
+        "away_run_diff":    away_rd,
         # Park / weather
         "park_factor_runs": pf["runs"],
         "park_factor_hr":   pf["hr"],
-        "wind_speed":       LEAGUE_AVG["wind_speed"],
-        "wind_dir_deg":     LEAGUE_AVG["wind_dir_deg"],
-        "temperature":      LEAGUE_AVG["temperature"],
+        "wind_speed":       wx.get("wind_speed",   LEAGUE_AVG["wind_speed"]),
+        "wind_dir_deg":     wx.get("wind_dir_deg", LEAGUE_AVG["wind_dir_deg"]),
+        "temperature":      wx.get("temperature",  LEAGUE_AVG["temperature"]),
     }
 
 
@@ -568,6 +702,14 @@ def main():
         all_sp_ids = [pid for pid in all_sp_ids if pid]
         game_logs = fetch_pitcher_game_logs(season, all_sp_ids)
 
+        # NEW: season run differentials (computed from already-fetched schedule)
+        run_diffs = compute_run_diffs(games)
+        logger.info("Run diffs computed for %d team-date pairs", len(run_diffs))
+
+        # NEW: historical weather per game via Open-Meteo archive
+        logger.info("Fetching historical weather for season %d...", season)
+        weather_map = fetch_weather_historical(season, games)
+
         # Batch-resolve names to warm name cache (avoids per-game API calls)
         ids_needed = {int(g[k]) for g in games for k in ("home_sp_id","away_sp_id") if g.get(k)}
         ids_missing = ids_needed - set(pitchers.keys())
@@ -577,7 +719,8 @@ def main():
                 resolve_name(pid)
 
         for game in games:
-            row = build_feature_row(game, pitchers, batting, game_logs)
+            row = build_feature_row(game, pitchers, batting, game_logs,
+                                    run_diffs=run_diffs, weather_map=weather_map)
             all_rows.append(row)
             hs, as_ = game["home_score"], game["away_score"]
             all_results.append({
