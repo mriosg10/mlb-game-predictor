@@ -545,7 +545,138 @@ def resolve_name(mlbam_id: int) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# 4f. Bullpen workload — relief appearances for bp_ip_3d
+# 4f. Rolling team batting stats (ops_14d / risp_14d)
+# ---------------------------------------------------------------------------
+
+def fetch_team_batting_gamelogs(season: int) -> dict:
+    """
+    Fetches per-game batting counting stats for all 30 teams.
+    Returns {team_abbr: [{date, h, ab, bb, hbp, tb, sf}]} sorted by date.
+    ~30 API calls per season, cached.
+    """
+    cache_key = f"team_batting_gamelogs_{season}"
+    cached = _load(cache_key)
+    if cached:
+        logger.info("Team batting game-log cache hit for %d", season)
+        return cached
+
+    all_teams_data = _mlb_get("/teams", params={"sportId": 1, "season": season})
+    teams = [
+        (t["abbreviation"], t["id"])
+        for t in all_teams_data.get("teams", [])
+        if "abbreviation" in t and "id" in t
+    ]
+
+    logger.info("Fetching team batting game logs for %d (%d teams)...", season, len(teams))
+    result: dict = {}
+
+    for abbr, tid in teams:
+        try:
+            data = _mlb_get(f"/teams/{tid}/stats",
+                            params={"stats": "gameLog", "group": "hitting", "season": season})
+            splits = data.get("stats", [{}])[0].get("splits", [])
+            games = []
+            for s in splits:
+                st = s.get("stat", {})
+                def _i(k):
+                    v = st.get(k, 0)
+                    try: return int(v)
+                    except: return 0
+                games.append({
+                    "date": s.get("date", ""),
+                    "h":   _i("hits"),
+                    "ab":  _i("atBats"),
+                    "bb":  _i("baseOnBalls"),
+                    "hbp": _i("hitByPitch"),
+                    "tb":  _i("totalBases"),
+                    "sf":  _i("sacFlies"),
+                })
+            games.sort(key=lambda x: x["date"])
+            result[abbr] = games
+            time.sleep(0.1)
+        except Exception as exc:
+            logger.warning("Team batting game log failed for %s: %s", abbr, exc)
+            result[abbr] = []
+
+    _save(cache_key, result)
+    logger.info("  -> %d teams batting logs cached for %d", len(result), season)
+    return result
+
+
+def compute_rolling_ops(team_batting_logs: dict, window: int = 14) -> dict:
+    """
+    For each (team, game_date), computes OPS over the prior `window` days
+    (exclusive of game_date itself — no look-ahead).
+    OBP = (H+BB+HBP) / (AB+BB+HBP+SF)   SLG = TB / AB
+    Falls back to league average when fewer than 3 games exist in the window.
+    Returns {(team_abbr, date_str): ops_float}.
+    """
+    result: dict = {}
+    for team, games in team_batting_logs.items():
+        for i, game in enumerate(games):
+            gd      = datetime.strptime(game["date"], "%Y-%m-%d")
+            cutoff  = (gd - timedelta(days=window)).strftime("%Y-%m-%d")
+            h = ab = bb = hbp = tb = sf = n_games = 0
+            for prev in games[:i]:
+                if prev["date"] >= cutoff:  # prior `window` days, exclusive of today
+                    h    += prev["h"];   ab  += prev["ab"]
+                    bb   += prev["bb"];  hbp += prev["hbp"]
+                    tb   += prev["tb"];  sf  += prev["sf"]
+                    n_games += 1
+            if ab < 10 or n_games < 3:
+                result[(team, game["date"])] = LEAGUE_AVG["ops_14d"]
+            else:
+                obp_d = ab + bb + hbp + sf
+                obp   = (h + bb + hbp) / obp_d if obp_d > 0 else 0.320
+                slg   = tb / ab
+                result[(team, game["date"])] = round(float(np.clip(obp + slg, 0.3, 1.5)), 4)
+    return result
+
+
+def fetch_team_risp_season(season: int) -> dict:
+    """
+    Fetches season RISP batting average per team via statSplits (sitCodes=risp).
+    Matches the live pipeline's RISP source exactly.
+    Returns {team_abbr: risp_avg_float}.  ~30 API calls per season, cached.
+    """
+    cache_key = f"team_risp_{season}"
+    cached = _load(cache_key)
+    if cached:
+        logger.info("RISP cache hit for %d", season)
+        return cached
+
+    all_teams_data = _mlb_get("/teams", params={"sportId": 1, "season": season})
+    teams = [
+        (t["abbreviation"], t["id"])
+        for t in all_teams_data.get("teams", [])
+        if "abbreviation" in t and "id" in t
+    ]
+
+    logger.info("Fetching RISP stats for %d teams in %d...", len(teams), season)
+    result: dict = {}
+
+    for abbr, tid in teams:
+        try:
+            data = _mlb_get(f"/teams/{tid}/stats", params={
+                "stats": "statSplits", "sitCodes": "risp",
+                "group": "hitting", "season": season,
+            })
+            splits = data.get("stats", [{}])[0].get("splits", [])
+            stat   = splits[0].get("stat", {}) if splits else {}
+            v      = stat.get("avg")
+            result[abbr] = float(v) if v else LEAGUE_AVG["risp_14d"]
+            time.sleep(0.05)
+        except Exception as exc:
+            logger.debug("RISP fetch failed for %s: %s", abbr, exc)
+            result[abbr] = LEAGUE_AVG["risp_14d"]
+
+    _save(cache_key, result)
+    logger.info("  -> %d teams RISP cached for %d", len(result), season)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 4g. Bullpen workload — relief appearances for bp_ip_3d
 # ---------------------------------------------------------------------------
 
 def fetch_team_id_map(season: int) -> dict:
@@ -693,7 +824,8 @@ def _pf(home_team: str) -> dict:
 
 def build_feature_row(game: dict, pitchers: dict, batting: dict, game_logs: dict,
                       run_diffs: dict = None, weather_map: dict = None,
-                      bp_ip_3d_map: dict = None) -> dict:
+                      bp_ip_3d_map: dict = None, rolling_ops_map: dict = None,
+                      risp_map: dict = None) -> dict:
     home_sp = _sp(game.get("home_sp_id"), pitchers)
     away_sp = _sp(game.get("away_sp_id"), pitchers)
     home_b  = _team(game["home_team"], batting)
@@ -710,8 +842,12 @@ def build_feature_row(game: dict, pitchers: dict, batting: dict, game_logs: dict
     home_rd  = run_diffs.get((game["home_team"], date), LEAGUE_AVG["run_diff"]) if run_diffs else LEAGUE_AVG["run_diff"]
     away_rd  = run_diffs.get((game["away_team"], date), LEAGUE_AVG["run_diff"]) if run_diffs else LEAGUE_AVG["run_diff"]
     wx       = weather_map.get(game["game_id"], {}) if weather_map else {}
-    home_bip = get_bp_ip_3d(game["home_team"], date, bp_ip_3d_map) if bp_ip_3d_map else LEAGUE_AVG["bp_ip_3d"]
-    away_bip = get_bp_ip_3d(game["away_team"], date, bp_ip_3d_map) if bp_ip_3d_map else LEAGUE_AVG["bp_ip_3d"]
+    home_bip  = get_bp_ip_3d(game["home_team"], date, bp_ip_3d_map) if bp_ip_3d_map else LEAGUE_AVG["bp_ip_3d"]
+    away_bip  = get_bp_ip_3d(game["away_team"], date, bp_ip_3d_map) if bp_ip_3d_map else LEAGUE_AVG["bp_ip_3d"]
+    home_ops  = rolling_ops_map.get((game["home_team"], date), home_b["ops"]) if rolling_ops_map else home_b["ops"]
+    away_ops  = rolling_ops_map.get((game["away_team"], date), away_b["ops"]) if rolling_ops_map else away_b["ops"]
+    home_risp = risp_map.get(game["home_team"], LEAGUE_AVG["risp_14d"]) if risp_map else home_b["avg"]
+    away_risp = risp_map.get(game["away_team"], LEAGUE_AVG["risp_14d"]) if risp_map else away_b["avg"]
 
     def _fip_bp(sp_stats):
         """Bullpen xERA proxy: SP xFIP * 1.05 (bullpen ERA typically slightly higher)."""
@@ -767,14 +903,14 @@ def build_feature_row(game: dict, pitchers: dict, batting: dict, game_logs: dict
         "away_bp_il_ct":  int(LEAGUE_AVG["bp_il_ct"]),
         # Home lineup
         "home_lineup_woba": home_b["woba"],
-        "home_ops_14d":     home_b["ops"],
-        "home_risp_14d":    home_b["avg"],
+        "home_ops_14d":     home_ops,
+        "home_risp_14d":    home_risp,
         "home_starters_il": int(LEAGUE_AVG["starters_il"]),
         "home_run_diff":    home_rd,
         # Away lineup
         "away_lineup_woba": away_b["woba"],
-        "away_ops_14d":     away_b["ops"],
-        "away_risp_14d":    away_b["avg"],
+        "away_ops_14d":     away_ops,
+        "away_risp_14d":    away_risp,
         "away_starters_il": int(LEAGUE_AVG["starters_il"]),
         "away_run_diff":    away_rd,
         # Park / weather
@@ -829,6 +965,12 @@ def main():
         run_diffs = compute_run_diffs(games)
         logger.info("Run diffs computed for %d team-date pairs", len(run_diffs))
 
+        # NEW: rolling 14-day team batting stats (ops_14d, risp_14d)
+        team_batting_logs = fetch_team_batting_gamelogs(season)
+        rolling_ops_map   = compute_rolling_ops(team_batting_logs)
+        risp_map          = fetch_team_risp_season(season)
+        logger.info("Rolling OPS computed for %d team-date pairs", len(rolling_ops_map))
+
         # NEW: historical weather per game via Open-Meteo archive
         logger.info("Fetching historical weather for season %d...", season)
         weather_map = fetch_weather_historical(season, games)
@@ -844,7 +986,9 @@ def main():
         for game in games:
             row = build_feature_row(game, pitchers, batting, game_logs,
                                     run_diffs=run_diffs, weather_map=weather_map,
-                                    bp_ip_3d_map=daily_bp_ip)
+                                    bp_ip_3d_map=daily_bp_ip,
+                                    rolling_ops_map=rolling_ops_map,
+                                    risp_map=risp_map)
             all_rows.append(row)
             hs, as_ = game["home_score"], game["away_score"]
             all_results.append({
