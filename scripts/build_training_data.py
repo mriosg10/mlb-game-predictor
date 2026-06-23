@@ -545,6 +545,118 @@ def resolve_name(mlbam_id: int) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# 4f. Bullpen workload — relief appearances for bp_ip_3d
+# ---------------------------------------------------------------------------
+
+def fetch_team_id_map(season: int) -> dict:
+    """Returns {team_id: team_abbr} for mapping game-log team IDs to abbreviations."""
+    cache_key = f"team_id_map_{season}"
+    cached = _load(cache_key)
+    if cached:
+        return {int(k): v for k, v in cached.items()}
+    data = _mlb_get("/teams", params={"sportId": 1, "season": season})
+    result = {
+        t["id"]: t["abbreviation"]
+        for t in data.get("teams", [])
+        if "id" in t and "abbreviation" in t
+    }
+    _save(cache_key, {str(k): v for k, v in result.items()})
+    return result
+
+
+def fetch_season_pitcher_ids(season: int) -> list:
+    """Returns all pitcher MLBAM IDs who appeared in regular-season games."""
+    cache_key = f"all_pitcher_ids_{season}"
+    cached = _load(cache_key)
+    if cached:
+        logger.info("All pitcher IDs cache hit for %d (%d pitchers)", season, len(cached))
+        return cached
+    logger.info("Fetching all pitcher IDs for %d ...", season)
+    data = _mlb_get("/sports/1/players", params={"season": season, "gameType": "R"})
+    ids = [
+        p["id"] for p in data.get("people", [])
+        if p.get("primaryPosition", {}).get("type") == "Pitcher"
+    ]
+    logger.info("  -> %d pitchers found for %d", len(ids), season)
+    _save(cache_key, ids)
+    return ids
+
+
+def fetch_pitcher_relief_logs(season: int, all_pitcher_ids: list, starter_ids: set) -> dict:
+    """
+    Fetches game logs for pitchers not already in starter_ids (relief
+    specialists + spot starters who rarely start).  Filters each log to
+    non-start appearances only (gamesStarted == 0, ip > 0).
+    Returns {pitcher_id: [{date, ip, team_id}]}.
+    """
+    cache_key = f"pitcher_relief_logs_{season}"
+    cached = _load(cache_key)
+    if cached:
+        logger.info("Relief log cache hit for %d (%d pitchers)", season, len(cached))
+        return {int(k): v for k, v in cached.items()}
+
+    relief_ids = [pid for pid in all_pitcher_ids if pid not in starter_ids]
+    logger.info("Fetching relief logs for %d pitchers in %d ...", len(relief_ids), season)
+
+    result: dict = {}
+    for i, pid in enumerate(relief_ids):
+        if i % 100 == 0 and i > 0:
+            logger.info("  relief logs: %d/%d ...", i, len(relief_ids))
+        try:
+            data = _mlb_get(f"/people/{pid}/stats", params={
+                "stats": "gameLog", "group": "pitching", "season": season,
+            })
+            appearances = []
+            for grp in data.get("stats", []):
+                for split in grp.get("splits", []):
+                    st = split.get("stat", {})
+                    if int(st.get("gamesStarted", 0)) >= 1:
+                        continue  # skip starts
+                    ip = _parse_ip(st.get("inningsPitched", 0))
+                    if ip <= 0:
+                        continue
+                    appearances.append({
+                        "date":    split.get("date", ""),
+                        "ip":      ip,
+                        "team_id": split.get("team", {}).get("id"),
+                    })
+            result[pid] = appearances
+        except Exception as exc:
+            logger.debug("Relief log failed for pitcher %d: %s", pid, exc)
+            result[pid] = []
+        time.sleep(0.08)
+
+    _save(cache_key, {str(k): v for k, v in result.items()})
+    logger.info("  -> %d relief pitchers cached for %d", len(result), season)
+    return result
+
+
+def compute_daily_bp_ip(relief_logs: dict, team_id_map: dict) -> dict:
+    """
+    Aggregates relief appearances into {(team_abbr, date): total_ip}.
+    Each appearance's team is taken from the game log split (correct across trades).
+    """
+    from collections import defaultdict
+    daily: dict = defaultdict(float)
+    for appearances in relief_logs.values():
+        for app in appearances:
+            abbr = team_id_map.get(app.get("team_id"))
+            if abbr:
+                daily[(abbr, app["date"])] += app["ip"]
+    return dict(daily)
+
+
+def get_bp_ip_3d(team: str, game_date_str: str, daily_bp_ip: dict) -> float:
+    """Total bullpen IP for `team` in the 3 calendar days before game_date."""
+    gd = datetime.strptime(game_date_str, "%Y-%m-%d")
+    total = sum(
+        daily_bp_ip.get((team, (gd - timedelta(days=d)).strftime("%Y-%m-%d")), 0.0)
+        for d in range(1, 4)
+    )
+    return float(np.clip(total, 0.0, 30.0))
+
+
+# ---------------------------------------------------------------------------
 # 5. Feature row builder
 # ---------------------------------------------------------------------------
 
@@ -580,7 +692,8 @@ def _pf(home_team: str) -> dict:
     }
 
 def build_feature_row(game: dict, pitchers: dict, batting: dict, game_logs: dict,
-                      run_diffs: dict = None, weather_map: dict = None) -> dict:
+                      run_diffs: dict = None, weather_map: dict = None,
+                      bp_ip_3d_map: dict = None) -> dict:
     home_sp = _sp(game.get("home_sp_id"), pitchers)
     away_sp = _sp(game.get("away_sp_id"), pitchers)
     home_b  = _team(game["home_team"], batting)
@@ -597,6 +710,8 @@ def build_feature_row(game: dict, pitchers: dict, batting: dict, game_logs: dict
     home_rd  = run_diffs.get((game["home_team"], date), LEAGUE_AVG["run_diff"]) if run_diffs else LEAGUE_AVG["run_diff"]
     away_rd  = run_diffs.get((game["away_team"], date), LEAGUE_AVG["run_diff"]) if run_diffs else LEAGUE_AVG["run_diff"]
     wx       = weather_map.get(game["game_id"], {}) if weather_map else {}
+    home_bip = get_bp_ip_3d(game["home_team"], date, bp_ip_3d_map) if bp_ip_3d_map else LEAGUE_AVG["bp_ip_3d"]
+    away_bip = get_bp_ip_3d(game["away_team"], date, bp_ip_3d_map) if bp_ip_3d_map else LEAGUE_AVG["bp_ip_3d"]
 
     def _fip_bp(sp_stats):
         """Bullpen xERA proxy: SP xFIP * 1.05 (bullpen ERA typically slightly higher)."""
@@ -642,12 +757,12 @@ def build_feature_row(game: dict, pitchers: dict, batting: dict, game_logs: dict
         "away_sp_whip_l3":       a_whip_l3,
         # Home BP
         "home_bp_xera":   _fip_bp(home_sp),
-        "home_bp_ip_3d":  LEAGUE_AVG["bp_ip_3d"],
+        "home_bp_ip_3d":  home_bip,
         "home_bp_li":     LEAGUE_AVG["bp_li"],
         "home_bp_il_ct":  int(LEAGUE_AVG["bp_il_ct"]),
         # Away BP
         "away_bp_xera":   _fip_bp(away_sp),
-        "away_bp_ip_3d":  LEAGUE_AVG["bp_ip_3d"],
+        "away_bp_ip_3d":  away_bip,
         "away_bp_li":     LEAGUE_AVG["bp_li"],
         "away_bp_il_ct":  int(LEAGUE_AVG["bp_il_ct"]),
         # Home lineup
@@ -702,6 +817,14 @@ def main():
         all_sp_ids = [pid for pid in all_sp_ids if pid]
         game_logs = fetch_pitcher_game_logs(season, all_sp_ids)
 
+        # NEW: bullpen workload — relief IP per team per day
+        team_id_map     = fetch_team_id_map(season)
+        all_pitcher_ids = fetch_season_pitcher_ids(season)
+        starter_ids     = set(game_logs.keys())
+        relief_logs     = fetch_pitcher_relief_logs(season, all_pitcher_ids, starter_ids)
+        daily_bp_ip     = compute_daily_bp_ip(relief_logs, team_id_map)
+        logger.info("Daily BP IP computed for %d team-date pairs", len(daily_bp_ip))
+
         # NEW: season run differentials (computed from already-fetched schedule)
         run_diffs = compute_run_diffs(games)
         logger.info("Run diffs computed for %d team-date pairs", len(run_diffs))
@@ -720,7 +843,8 @@ def main():
 
         for game in games:
             row = build_feature_row(game, pitchers, batting, game_logs,
-                                    run_diffs=run_diffs, weather_map=weather_map)
+                                    run_diffs=run_diffs, weather_map=weather_map,
+                                    bp_ip_3d_map=daily_bp_ip)
             all_rows.append(row)
             hs, as_ = game["home_score"], game["away_score"]
             all_results.append({
