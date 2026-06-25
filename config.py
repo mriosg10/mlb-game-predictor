@@ -169,11 +169,13 @@ FEATURE_COLUMNS: list[str] = [
     "park_factor_runs","park_factor_hr",
     "wind_speed",      "wind_dir_deg",     "temperature",
     "umpire_run_factor","is_dome",
+    # Market line (1) — Vegas O/U; filled with league avg when no line is available
+    "ou_line",
     # Run-environment composites — derived at train/inference time (3)
     "sum_sp_era_l3",   "sum_ops_14d",      "avg_sp_k_pct",
 ]
 
-OU_FEATURE_COLUMNS = FEATURE_COLUMNS + ["ou_line"]  # 54 features for the OU classifier
+OU_FEATURE_COLUMNS = FEATURE_COLUMNS  # ou_line is now included in FEATURE_COLUMNS
 
 # ---------------------------------------------------------------------------
 # League-average fallback values
@@ -221,6 +223,7 @@ LEAGUE_AVG: dict[str, float] = {
     "wind_speed":        5.0,
     "wind_dir_deg":      0.0,
     "temperature":      72.0,
+    "ou_line":           8.7,   # MLB avg total ~8.6–8.7 runs (2022–2025)
 }
 
 # ---------------------------------------------------------------------------

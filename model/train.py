@@ -72,8 +72,8 @@ OU_PARAMS = {
 }
 
 TOTAL_PARAMS = {
-    "objective":        "reg:squarederror",
-    "eval_metric":      "mae",
+    "objective":        "count:poisson",
+    "eval_metric":      "poisson-nloglik",
     "n_estimators":     400,
     "max_depth":        4,
     "learning_rate":    0.05,
@@ -86,7 +86,8 @@ TOTAL_PARAMS = {
 }
 
 # Season recency weights — more recent seasons get higher weight
-_SEASON_WEIGHTS = {2021: 0.3, 2022: 0.5, 2023: 0.7, 2024: 0.85, 2025: 1.0, 2026: 1.0}
+# 2019 was the "juiced ball" era (~9.65 runs/game vs ~8.6 in 2022–2025); downweighted to avoid bias
+_SEASON_WEIGHTS = {2019: 0.2, 2021: 0.3, 2022: 0.5, 2023: 0.7, 2024: 0.85, 2025: 1.0, 2026: 1.0}
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +204,17 @@ def load_data(include_live: bool = False) -> tuple[pd.DataFrame, pd.Series, pd.S
             n_live = len(live_df)
 
     df = _add_composite_features(df)
+
+    # Join ou_line from historical CSV; games without a real line get league average
+    ou_path = BASE_DIR / "data" / "historical_ou.csv"
+    if ou_path.exists() and "ou_line" not in df.columns:
+        ou_df = pd.read_csv(ou_path, dtype={"game_id": str})
+        if "ou_line" in ou_df.columns:
+            df = df.merge(ou_df[["game_id", "ou_line"]], on="game_id", how="left")
+    if "ou_line" not in df.columns:
+        df["ou_line"] = LEAGUE_AVG["ou_line"]
+    else:
+        df["ou_line"] = df["ou_line"].fillna(LEAGUE_AVG["ou_line"])
 
     for col in FEATURE_COLUMNS:
         if col not in df.columns:

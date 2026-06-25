@@ -219,6 +219,13 @@ def predict_batch(
     df = pd.DataFrame(feature_rows)
     df = _add_composite_features(df)
 
+    # Inject real sportsbook O/U lines where available (overrides LEAGUE_AVG default)
+    if ou_lines:
+        valid = {str(k): v for k, v in ou_lines.items() if v is not None}
+        if valid:
+            mapped = df["game_id"].astype(str).map(valid)
+            df.loc[mapped.notna(), "ou_line"] = mapped[mapped.notna()]
+
     for col in FEATURE_COLUMNS:
         if col not in df.columns:
             df[col] = 0.0

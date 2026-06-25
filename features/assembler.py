@@ -511,6 +511,8 @@ def assemble_game_features(
     ):
         row.update(block)
     row["umpire_run_factor"] = umpire_run_factor
+    # Market line default — overwritten with real sportsbook line at inference time
+    row["ou_line"] = LEAGUE_AVG["ou_line"]
 
     # --- Missing-feature gate (AC-10 / Section 5.4) ---
     total_features = len(FEATURE_COLUMNS)
