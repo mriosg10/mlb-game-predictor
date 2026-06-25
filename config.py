@@ -32,7 +32,7 @@ MODEL_VERSION = (
 # ---------------------------------------------------------------------------
 MLB_API_BASE = "https://statsapi.mlb.com/api/v1"
 OPEN_METEO_BASE = "https://api.open-meteo.com/v1/forecast"
-ROTOWIRE_LINEUPS_URL = "https://www.rotowire.com/baseball/lineups.php"
+ROTOWIRE_LINEUPS_URL = "https://www.rotowire.com/baseball/daily-lineups.php"
 
 # Optional – moneyline odds (set MLB_ODDS_API_KEY env var to enable)
 ODDS_API_KEY = os.environ.get("MLB_ODDS_API_KEY", "")

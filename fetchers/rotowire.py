@@ -105,49 +105,77 @@ def _parse_lineups(html: str) -> list[GameLineups]:
 
 
 def _parse_card(card: Tag) -> GameLineups | None:
-    # Extract team abbreviations
-    team_tags = card.find_all(class_=re.compile(r"lineup__abbr|team-abbr"))
-    if len(team_tags) < 2:
-        # Try text content of header elements
-        abbr_tags = card.find_all(["span", "div"], string=re.compile(r"^[A-Z]{2,3}$"))
-        if len(abbr_tags) < 2:
-            return None
-        team_tags = abbr_tags[:2]
+    # --- Team abbreviations ---
+    # Current structure: button[data-team] with data-home="0" (away) / "1" (home)
+    away_abbr = home_abbr = None
+    for btn in card.find_all("button", attrs={"data-team": True}):
+        team = btn.get("data-team", "").upper()
+        if not team:
+            continue
+        if btn.get("data-home") == "1" and not home_abbr:
+            home_abbr = team
+        elif btn.get("data-home") == "0" and not away_abbr:
+            away_abbr = team
 
-    away_abbr = team_tags[0].get_text(strip=True)
-    home_abbr = team_tags[1].get_text(strip=True)
+    # Fallback: legacy .lineup__abbr elements
+    if not away_abbr or not home_abbr:
+        team_tags = card.find_all(class_=re.compile(r"lineup__abbr|team-abbr"))
+        if len(team_tags) >= 2:
+            away_abbr = team_tags[0].get_text(strip=True)
+            home_abbr = team_tags[1].get_text(strip=True)
 
-    # Game time
+    if not away_abbr or not home_abbr:
+        return None
+
+    # --- Game time ---
     time_tag = card.find(class_=re.compile(r"lineup__time|game-time"))
     game_time = time_tag.get_text(strip=True) if time_tag else ""
 
-    # Pitcher blocks
-    pitcher_tags = card.find_all(class_=re.compile(r"lineup__pitcher|sp-name"))
+    # --- Batting order lists ---
+    # is-visit = away, is-home = home
+    visit_list = card.find(class_=lambda c: c and "lineup__list" in c and "is-visit" in c)
+    home_list  = card.find(class_=lambda c: c and "lineup__list" in c and "is-home" in c)
 
-    def _extract_pitcher(tag: Tag | None) -> tuple[str, str]:
-        if tag is None:
+    # Positional fallback
+    if visit_list is None or home_list is None:
+        list_tags = card.find_all(class_=re.compile(r"lineup__list|batter-list"))
+        if visit_list is None:
+            visit_list = list_tags[0] if list_tags else None
+        if home_list is None:
+            home_list = list_tags[1] if len(list_tags) > 1 else None
+
+    # --- Pitchers ---
+    # Current: first .lineup__player-highlight in each list contains pitcher
+    # Legacy: .lineup__pitcher block
+    def _pitcher_from_list(lst: Tag | None) -> tuple[str, str]:
+        if lst is None:
             return ("TBD", "?")
-        text = tag.get_text(separator=" ", strip=True)
-        # Hand is often in parens: "J. Doe (R)" or as a sub-span
-        hand_match = re.search(r"\(([LRS])\)", text)
-        hand = hand_match.group(1) if hand_match else "?"
-        name = re.sub(r"\([LRS]\)", "", text).strip()
-        return (name, hand)
+        highlight = lst.find(class_=re.compile(r"lineup__player-highlight"))
+        if highlight:
+            name_block = highlight.find(class_="lineup__player-highlight-name")
+            if name_block:
+                name_link = name_block.find("a")
+                name = name_link.get_text(strip=True) if name_link else "TBD"
+                throws = name_block.find(class_="lineup__throws")
+                hand = throws.get_text(strip=True) if throws else "?"
+                return (name or "TBD", hand or "?")
+        # Legacy fallback: .lineup__pitcher or parens-hand text
+        pitcher_tag = lst.find(class_=re.compile(r"lineup__pitcher|sp-name"))
+        if pitcher_tag:
+            text = pitcher_tag.get_text(separator=" ", strip=True)
+            hand_m = re.search(r"\(([LRS])\)", text)
+            hand = hand_m.group(1) if hand_m else "?"
+            name = re.sub(r"\([LRS]\)", "", text).strip()
+            return (name or "TBD", hand or "?")
+        return ("TBD", "?")
 
-    away_pitcher_name, away_pitcher_hand = _extract_pitcher(
-        pitcher_tags[0] if pitcher_tags else None
-    )
-    home_pitcher_name, home_pitcher_hand = _extract_pitcher(
-        pitcher_tags[1] if len(pitcher_tags) > 1 else None
-    )
+    away_pitcher_name, away_pitcher_hand = _pitcher_from_list(visit_list)
+    home_pitcher_name, home_pitcher_hand = _pitcher_from_list(home_list)
 
-    # Batting order lists
-    list_tags = card.find_all(class_=re.compile(r"lineup__list|batter-list"))
-    away_batters = _extract_batters(list_tags[0] if list_tags else None)
-    home_batters = _extract_batters(list_tags[1] if len(list_tags) > 1 else None)
+    away_batters = _extract_batters(visit_list)
+    home_batters = _extract_batters(home_list)
 
-    confirmed_tag = card.find(class_=re.compile(r"lineup__confirmed|lineup-confirmed"))
-    is_confirmed = confirmed_tag is not None or "confirmed" in card.get_text().lower()
+    is_confirmed = bool(card.find(class_=re.compile(r"is-confirmed")))
 
     return GameLineups(
         home=ConfirmedLineup(
@@ -172,16 +200,26 @@ def _extract_batters(tag: Tag | None) -> list[dict]:
     if tag is None:
         return []
     batters = []
-    items = tag.find_all(["li", "div"], class_=re.compile(r"lineup__player|batter"))
-    for item in items:
-        text = item.get_text(separator=" ", strip=True)
-        hand_match = re.search(r"\b([LRS])\b", text)
-        hand = hand_match.group(1) if hand_match else "?"
-        pos_match = re.search(r"\b([A-Z]{1,2})\b", text)
-        pos = pos_match.group(1) if pos_match and len(pos_match.group(1)) <= 2 else "?"
-        name = re.sub(r"\s+", " ", re.sub(r"\([^)]*\)", "", text)).strip()
+    # Exclude pitcher-highlight items; match only plain lineup__player entries
+    items = tag.find_all(
+        "li",
+        class_=lambda c: c and "lineup__player" in c and "lineup__player-highlight" not in " ".join(c),
+    )
+    # Fallback to div-based selectors used by some older page variants
+    if not items:
+        items = tag.find_all(["li", "div"], class_=re.compile(r"^lineup__player$|batter"))
+    for item in items[:9]:
+        pos_tag = item.find(class_="lineup__pos")
+        pos = pos_tag.get_text(strip=True) if pos_tag else "?"
+        name_link = item.find("a")
+        if name_link:
+            name = name_link.get("title") or name_link.get_text(strip=True)
+        else:
+            name = item.get_text(separator=" ", strip=True)
+        bats_tag = item.find(class_="lineup__bats")
+        hand = bats_tag.get_text(strip=True) if bats_tag else "?"
         batters.append({"name": name, "hand": hand, "pos": pos})
-    return batters[:9]  # batting order is 9 spots
+    return batters
 
 
 # ---------------------------------------------------------------------------
