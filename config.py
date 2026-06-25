@@ -15,9 +15,10 @@ DB_PATH = os.environ.get("MLB_DB_PATH", str(BASE_DIR / "mlb_predictions.duckdb")
 MODEL_DIR = Path(os.environ.get("MLB_MODEL_DIR", str(BASE_DIR / "models")))
 LOG_DIR = Path(os.environ.get("MLB_LOG_DIR", str(BASE_DIR / "logs")))
 
-WIN_MODEL_PATH = str(MODEL_DIR / "xgb_win_prob.json")
-TOTAL_MODEL_PATH = str(MODEL_DIR / "xgb_run_total.json")
-OU_MODEL_PATH = str(MODEL_DIR / "xgb_ou_prob.json")
+WIN_MODEL_PATH        = str(MODEL_DIR / "xgb_win_prob.json")
+TOTAL_MODEL_PATH      = str(MODEL_DIR / "xgb_run_total.json")
+OU_MODEL_PATH         = str(MODEL_DIR / "xgb_ou_prob.json")
+CALIBRATOR_PATH       = str(MODEL_DIR / "win_prob_calibrator.pkl")
 
 _version_path = MODEL_DIR / "version.txt"
 MODEL_VERSION = (
@@ -79,6 +80,7 @@ CURRENT_SEASON = datetime.date.today().year
 # ---------------------------------------------------------------------------
 RETRACTABLE_ROOF_VENUES = {
     "Minute Maid Park",       # HOU
+    "Daikin Park",            # HOU (renamed 2026)
     "Globe Life Field",       # TEX
     "T-Mobile Park",          # SEA
     "American Family Field",  # MIL
@@ -99,11 +101,13 @@ VENUE_COORDS: dict[str, dict] = {
     "Coors Field":                {"lat": 39.7559,  "lon": -104.9942, "team": "COL"},
     "Petco Park":                 {"lat": 32.7073,  "lon": -117.1566, "team": "SD"},
     "Minute Maid Park":           {"lat": 29.7573,  "lon": -95.3555,  "team": "HOU"},
+    "Daikin Park":                {"lat": 29.7573,  "lon": -95.3555,  "team": "HOU"},  # renamed 2026
     "Globe Life Field":           {"lat": 32.7474,  "lon": -97.0832,  "team": "TEX"},
     "T-Mobile Park":              {"lat": 47.5914,  "lon": -122.3325, "team": "SEA"},
     "Fenway Park":                {"lat": 42.3467,  "lon": -71.0972,  "team": "BOS"},
     "Yankee Stadium":             {"lat": 40.8296,  "lon": -73.9262,  "team": "NYY"},
     "Dodger Stadium":             {"lat": 34.0739,  "lon": -118.2400, "team": "LAD"},
+    "UNIQLO Field at Dodger Stadium": {"lat": 34.0739, "lon": -118.2400, "team": "LAD"},  # renamed 2026
     "Angel Stadium":              {"lat": 33.8003,  "lon": -117.8827, "team": "LAA"},
     "Busch Stadium":              {"lat": 38.6226,  "lon": -90.1928,  "team": "STL"},
     "Truist Park":                {"lat": 33.8907,  "lon": -84.4677,  "team": "ATL"},
@@ -113,6 +117,7 @@ VENUE_COORDS: dict[str, dict] = {
     "Comerica Park":              {"lat": 42.3390,  "lon": -83.0485,  "team": "DET"},
     "Target Field":               {"lat": 44.9817,  "lon": -93.2778,  "team": "MIN"},
     "Guaranteed Rate Field":      {"lat": 41.8300,  "lon": -87.6339,  "team": "CWS"},
+    "Rate Field":                 {"lat": 41.8300,  "lon": -87.6339,  "team": "CWS"},
     "Kauffman Stadium":           {"lat": 39.0517,  "lon": -94.4803,  "team": "KC"},
     "Oakland Coliseum":           {"lat": 37.7516,  "lon": -122.2005, "team": "OAK"},
     "Citizens Bank Park":         {"lat": 39.9061,  "lon": -75.1665,  "team": "PHI"},
@@ -134,31 +139,38 @@ VENUE_COORDS: dict[str, dict] = {
 # degrees 0-360) is the model input derived from it.
 # ---------------------------------------------------------------------------
 FEATURE_COLUMNS: list[str] = [
-    # Home starting pitcher (15)
+    # Home starting pitcher (16)
     "home_sp_xera",    "home_sp_fip",      "home_sp_xfip",       "home_sp_siera",
     "home_sp_k_pct",   "home_sp_bb_pct",   "home_sp_barrel",     "home_sp_hh_pct",
     "home_sp_exit_velo","home_sp_spin",    "home_sp_days_rest",
     "home_sp_hand_match_pct",              "home_sp_bvp_woba",
-    "home_sp_era_l3",  "home_sp_whip_l3",
-    # Away starting pitcher (15)
+    "home_sp_era_l3",  "home_sp_whip_l3",  "home_sp_xera_delta",
+    # Away starting pitcher (16)
     "away_sp_xera",    "away_sp_fip",      "away_sp_xfip",       "away_sp_siera",
     "away_sp_k_pct",   "away_sp_bb_pct",   "away_sp_barrel",     "away_sp_hh_pct",
     "away_sp_exit_velo","away_sp_spin",    "away_sp_days_rest",
     "away_sp_hand_match_pct",              "away_sp_bvp_woba",
-    "away_sp_era_l3",  "away_sp_whip_l3",
+    "away_sp_era_l3",  "away_sp_whip_l3",  "away_sp_xera_delta",
     # Home bullpen (4)
     "home_bp_xera",    "home_bp_ip_3d",    "home_bp_li",         "home_bp_il_ct",
     # Away bullpen (4)
     "away_bp_xera",    "away_bp_ip_3d",    "away_bp_li",         "away_bp_il_ct",
-    # Home lineup/offense (5)
+    # Home lineup/offense (10)
     "home_lineup_woba","home_ops_14d",     "home_risp_14d",
     "home_starters_il","home_run_diff",
-    # Away lineup/offense (5)
+    "home_win_pct",    "home_back_to_back","home_series_game",
+    "home_win_streak", "home_team_days_rest",
+    # Away lineup/offense (10)
     "away_lineup_woba","away_ops_14d",     "away_risp_14d",
     "away_starters_il","away_run_diff",
-    # Park and weather (5 numeric)
+    "away_win_pct",    "away_back_to_back","away_series_game",
+    "away_win_streak", "away_team_days_rest",
+    # Park, weather and umpire (7 numeric)
     "park_factor_runs","park_factor_hr",
     "wind_speed",      "wind_dir_deg",     "temperature",
+    "umpire_run_factor","is_dome",
+    # Run-environment composites — derived at train/inference time (3)
+    "sum_sp_era_l3",   "sum_ops_14d",      "avg_sp_k_pct",
 ]
 
 OU_FEATURE_COLUMNS = FEATURE_COLUMNS + ["ou_line"]  # 54 features for the OU classifier
@@ -193,12 +205,34 @@ LEAGUE_AVG: dict[str, float] = {
     "risp_14d":         0.255,
     "starters_il":      1,
     "run_diff":         0.0,
+    "win_pct":          0.500,
+    "back_to_back":     0,
+    "series_game":      2,
+    "win_streak":       0,
+    "team_days_rest":   1,
+    "sp_xera_delta":    0.0,
+    "is_dome":          0,
+    "umpire_run_factor":1.0,
+    "sum_sp_era_l3":    8.40,   # 2 × league-avg 4.20
+    "sum_ops_14d":      1.44,   # 2 × league-avg 0.720
+    "avg_sp_k_pct":     0.225,
     "park_factor_runs":100.0,
     "park_factor_hr":  100.0,
     "wind_speed":        5.0,
     "wind_dir_deg":      0.0,
     "temperature":      72.0,
 }
+
+# ---------------------------------------------------------------------------
+# OU model training threshold
+# Minimum games with a real ou_line before training XGBoost OU classifier.
+# Logistic fallback is used below this threshold.
+# ---------------------------------------------------------------------------
+OU_MIN_GAMES = 200
+
+# Teams that play in dome or retractable-roof stadiums (weather-neutral).
+# Used to populate the is_dome feature in both training data and inference.
+DOME_TEAMS: set[str] = {"HOU", "TEX", "SEA", "MIL", "ARI", "MIA", "TOR", "TB"}
 
 # ---------------------------------------------------------------------------
 # Park factors — 3-year average (runs, HR), base 100

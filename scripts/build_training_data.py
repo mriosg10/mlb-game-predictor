@@ -34,7 +34,7 @@ import numpy as np
 import pandas as pd
 import requests
 
-from config import FEATURE_COLUMNS, LEAGUE_AVG, PARK_FACTORS_HARDCODED, VENUE_COORDS
+from config import DOME_TEAMS, FEATURE_COLUMNS, LEAGUE_AVG, PARK_FACTORS_HARDCODED, VENUE_COORDS
 
 logging.basicConfig(
     level=logging.INFO,
@@ -676,6 +676,210 @@ def fetch_team_risp_season(season: int) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# 4g-extra. Win/loss streak per (team, date)
+# ---------------------------------------------------------------------------
+
+def compute_win_streaks(games: list) -> dict:
+    """
+    For each (team_abbr, game_date) compute the consecutive win/loss streak
+    BEFORE that game.  Positive = win streak, negative = loss streak, 0 = none.
+    Returns {(team_abbr, date_str): streak_int}.
+    """
+    games_sorted = sorted(games, key=lambda g: g["game_date"])
+    team_results: dict[str, list] = {}  # team → [(date_str, won)]
+    for g in games_sorted:
+        hs, as_ = g["home_score"], g["away_score"]
+        home_won = hs > as_
+        d = g["game_date"]
+        for team, won in [(g["home_team"], home_won), (g["away_team"], not home_won)]:
+            team_results.setdefault(team, []).append((d, won))
+
+    result = {}
+    for team, results_list in team_results.items():
+        for i, (d, _) in enumerate(results_list):
+            prior = results_list[:i]
+            if not prior:
+                result[(team, d)] = 0
+                continue
+            last_won = prior[-1][1]
+            streak = 0
+            for _, won in reversed(prior):
+                if won == last_won:
+                    streak += 1
+                else:
+                    break
+            direction = 1 if last_won else -1
+            result[(team, d)] = int(max(-10, min(10, direction * streak)))
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 4g-extra-1b. Team days of rest per (team, date)
+# ---------------------------------------------------------------------------
+
+def compute_team_days_rest(games: list) -> dict:
+    """
+    For each (team_abbr, game_date) compute days since team's previous game.
+    Returns {(team_abbr, date_str): days_int}, capped at 7.
+    """
+    games_sorted = sorted(games, key=lambda g: g["game_date"])
+    last_played: dict[str, str] = {}
+    result: dict = {}
+
+    for g in games_sorted:
+        date = g["game_date"]
+        for team in (g["home_team"], g["away_team"]):
+            if (team, date) in result:
+                continue  # doubleheader: already recorded
+            prev = last_played.get(team)
+            if prev:
+                days = (datetime.strptime(date, "%Y-%m-%d") -
+                        datetime.strptime(prev, "%Y-%m-%d")).days
+                result[(team, date)] = min(days, 7)
+            else:
+                result[(team, date)] = int(LEAGUE_AVG["team_days_rest"])
+
+        # Update last-played after snapshot
+        last_played[g["home_team"]] = date
+        last_played[g["away_team"]] = date
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 4g-extra-2. Team roster handedness (for hand_match_pct fallback)
+# ---------------------------------------------------------------------------
+
+def fetch_team_roster_hands(season: int, team_id_map: dict) -> dict:
+    """
+    Returns {team_abbr: {"l_pct": float, "r_pct": float}} based on active roster.
+    Switch hitters count as 0.5.  ~30 API calls per season, cached.
+    """
+    cache_key = f"team_roster_hands_{season}"
+    cached = _load(cache_key)
+    if cached:
+        logger.info("Roster handedness cache hit for %d", season)
+        return cached
+
+    result = {}
+    for tid, abbr in team_id_map.items():
+        try:
+            data = _mlb_get(f"/teams/{tid}/roster",
+                            params={"rosterType": "active", "season": season})
+            l = r = s = 0
+            for p in data.get("roster", []):
+                if p.get("position", {}).get("abbreviation", "P") == "P":
+                    continue
+                bats = p.get("person", {}).get("batSide", {}).get("code", "R")
+                if bats == "L":   l += 1
+                elif bats == "S": s += 1
+                else:             r += 1
+            total = l + r + s
+            result[abbr] = ({"l_pct": round((l + s * 0.5) / total, 3),
+                              "r_pct": round((r + s * 0.5) / total, 3)}
+                            if total > 0 else {"l_pct": 0.45, "r_pct": 0.55})
+            time.sleep(0.1)
+        except Exception as exc:
+            logger.warning("Roster hands failed for %s: %s", abbr, exc)
+            result[abbr] = {"l_pct": 0.45, "r_pct": 0.55}
+
+    _save(cache_key, result)
+    logger.info("  -> Roster handedness cached for %d teams in %d", len(result), season)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 4g-extra-3. Team bullpen LI proxy (saves/holds/blown saves from MLB API)
+# ---------------------------------------------------------------------------
+
+def fetch_team_bp_li_season(season: int, team_id_map: dict) -> dict:
+    """
+    Returns {team_abbr: li_proxy_float} for the season.  ~30 API calls, cached.
+    """
+    cache_key = f"team_bp_li_{season}"
+    cached = _load(cache_key)
+    if cached:
+        logger.info("BP LI proxy cache hit for %d", season)
+        return cached
+
+    result = {}
+    for tid, abbr in team_id_map.items():
+        try:
+            data = _mlb_get(f"/teams/{tid}/stats",
+                            params={"season": season, "group": "pitching", "stats": "season"})
+            splits = data.get("stats", [{}])[0].get("splits", [])
+            stat   = splits[0].get("stat", {}) if splits else {}
+            sv  = int(stat.get("saves",      0) or 0)
+            hld = int(stat.get("holds",      0) or 0)
+            bs  = int(stat.get("blownSaves", 0) or 0)
+            total = sv + hld + bs
+            if total >= 10:
+                ratio = (sv + hld) / total
+                li = round(float(np.clip((ratio / 0.75) * LEAGUE_AVG["bp_li"], 0.5, 2.0)), 3)
+            else:
+                li = LEAGUE_AVG["bp_li"]
+            result[abbr] = li
+            time.sleep(0.1)
+        except Exception as exc:
+            logger.warning("BP LI proxy failed for %s: %s", abbr, exc)
+            result[abbr] = LEAGUE_AVG["bp_li"]
+
+    _save(cache_key, result)
+    logger.info("  -> BP LI proxy cached for %d teams in %d", len(result), season)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 4g-extra-4. Umpire assignments per game (HP ump from schedule API)
+# ---------------------------------------------------------------------------
+
+def fetch_season_umpires(season: int) -> dict:
+    """
+    Returns {game_id_str: ump_name} for all regular-season games.
+    Makes 7 monthly schedule API calls with officials hydration.  Cached per season.
+    """
+    cache_key = f"umpires_{season}"
+    cached = _load(cache_key)
+    if cached:
+        logger.info("Umpire cache hit for %d (%d games)", season, len(cached))
+        return cached
+
+    logger.info("Fetching umpire assignments for %d...", season)
+    result = {}
+    month_ranges = [
+        (f"{season}-03-25", f"{season}-04-30"),
+        (f"{season}-05-01", f"{season}-05-31"),
+        (f"{season}-06-01", f"{season}-06-30"),
+        (f"{season}-07-01", f"{season}-07-31"),
+        (f"{season}-08-01", f"{season}-08-31"),
+        (f"{season}-09-01", f"{season}-09-30"),
+        (f"{season}-10-01", f"{season}-10-10"),
+    ]
+    for start, end in month_ranges:
+        try:
+            data = _mlb_get("/schedule", params={
+                "sportId": 1, "startDate": start, "endDate": end,
+                "gameType": "R", "hydrate": "officials",
+            })
+            for day in data.get("dates", []):
+                for g in day.get("games", []):
+                    pk = str(g["gamePk"])
+                    ump_name = "TBD"
+                    for official in g.get("officials", []):
+                        if official.get("officialType") == "Home Plate":
+                            ump_name = official.get("official", {}).get("fullName", "TBD")
+                            break
+                    result[pk] = ump_name
+            time.sleep(0.3)
+        except Exception as exc:
+            logger.warning("Umpire fetch failed for %s-%s: %s", start, end, exc)
+
+    _save(cache_key, result)
+    logger.info("  -> Umpires fetched for %d games in %d", len(result), season)
+    return result
+
+
+# ---------------------------------------------------------------------------
 # 4g. Bullpen workload — relief appearances for bp_ip_3d
 # ---------------------------------------------------------------------------
 
@@ -788,6 +992,146 @@ def get_bp_ip_3d(team: str, game_date_str: str, daily_bp_ip: dict) -> float:
 
 
 # ---------------------------------------------------------------------------
+# 4h. IL transactions — starters_il / bp_il_ct
+# ---------------------------------------------------------------------------
+
+def fetch_team_il_transactions(season: int, all_pitcher_ids: set, team_id_map: dict) -> dict:
+    """
+    Fetches all IL transactions for all 30 teams for the full season.
+    Marks each player as pitcher/non-pitcher using all_pitcher_ids.
+    Returns {team_abbr: [{player_id, is_pitcher, type, date}]} sorted by date.
+    ~30 API calls per season, cached.
+    """
+    cache_key = f"team_il_transactions_{season}"
+    cached = _load(cache_key)
+    if cached:
+        logger.info("IL transactions cache hit for %d", season)
+        return cached
+
+    pitcher_set = set(all_pitcher_ids)
+    result: dict = {}
+
+    for team_id, abbr in team_id_map.items():
+        try:
+            data = _mlb_get("/transactions", params={
+                "teamId":    team_id,
+                "startDate": f"{season}-03-01",
+                "endDate":   f"{season}-10-15",
+            })
+            txns = []
+            for t in data.get("transactions", []):
+                pid = t.get("person", {}).get("id")
+                if pid is None:
+                    continue
+                txns.append({
+                    "player_id":  int(pid),
+                    "is_pitcher": int(pid) in pitcher_set,
+                    "type":       t.get("typeCode", ""),
+                    "date":       t.get("date", ""),
+                })
+            txns.sort(key=lambda x: x["date"])
+            result[abbr] = txns
+            time.sleep(0.1)
+        except Exception as exc:
+            logger.warning("IL transactions failed for team %d (%s) %d: %s", team_id, abbr, season, exc)
+            result[abbr] = []
+
+    _save(cache_key, result)
+    logger.info("  -> IL transactions cached for %d teams in %d", len(result), season)
+    return result
+
+
+def get_il_counts(team_abbr: str, game_date_str: str, il_transactions: dict) -> tuple:
+    """
+    Returns (bp_il_ct, starters_il) by replaying IL transactions up to game_date.
+    Mirrors the logic in fetchers/mlb_stats.py:count_il_players().
+    """
+    txns = il_transactions.get(team_abbr, [])
+    on_il_pitchers:     set = set()
+    on_il_non_pitchers: set = set()
+
+    for t in txns:
+        if t.get("date", "") >= game_date_str:
+            break
+        pid = t.get("player_id")
+        if pid is None:
+            continue
+        type_code = t.get("type", "")
+        if type_code in ("IL10", "IL15", "IL60", "SUSP", "BRV"):
+            if t.get("is_pitcher"):
+                on_il_pitchers.add(pid)
+            else:
+                on_il_non_pitchers.add(pid)
+        elif type_code in ("CRA", "REL"):
+            on_il_pitchers.discard(pid)
+            on_il_non_pitchers.discard(pid)
+
+    return len(on_il_pitchers), len(on_il_non_pitchers)
+
+
+# ---------------------------------------------------------------------------
+# 4i. Schedule-based features — win%, back-to-back, series game#
+# ---------------------------------------------------------------------------
+
+def compute_schedule_features(games: list) -> dict:
+    """
+    For each (team, game_date), computes pre-game win%, back-to-back flag,
+    and series game number from the season's already-fetched schedule results.
+    Returns {(team_abbr, date_str): {"win_pct": float, "back_to_back": int, "series_game": int}}.
+    Handles doubleheaders: both games on the same date see the same pre-day snapshot.
+    """
+    sorted_games = sorted(games, key=lambda g: (g["game_date"], g["game_id"]))
+
+    wins:       dict[str, int] = {}
+    losses:     dict[str, int] = {}
+    last_date:  dict[str, str] = {}
+    last_opp:   dict[str, str] = {}
+    series_num: dict[str, int] = {}
+    result:     dict[tuple, dict] = {}
+
+    for game in sorted_games:
+        home, away = game["home_team"], game["away_team"]
+        date = game["game_date"]
+        prev_date_str = (datetime.strptime(date, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+
+        for team, opp in [(home, away), (away, home)]:
+            if (team, date) in result:
+                continue  # doubleheader: pre-game snapshot already recorded
+
+            w, l = wins.get(team, 0), losses.get(team, 0)
+            wpct = w / (w + l) if (w + l) > 0 else 0.500
+
+            b2b = 1 if last_date.get(team) == prev_date_str else 0
+
+            if last_opp.get(team) == opp and last_date.get(team) == prev_date_str:
+                series_num[team] = series_num.get(team, 0) + 1
+            else:
+                series_num[team] = 1
+
+            result[(team, date)] = {
+                "win_pct":      round(wpct, 4),
+                "back_to_back": b2b,
+                "series_game":  min(series_num[team], 7),
+            }
+
+        # Post-game: update running totals and last-played tracking
+        hs, as_ = game["home_score"], game["away_score"]
+        if hs > as_:
+            wins[home]   = wins.get(home, 0) + 1
+            losses[away] = losses.get(away, 0) + 1
+        elif as_ > hs:
+            wins[away]   = wins.get(away, 0) + 1
+            losses[home] = losses.get(home, 0) + 1
+
+        last_date[home] = date
+        last_date[away] = date
+        last_opp[home]  = away
+        last_opp[away]  = home
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # 5. Feature row builder
 # ---------------------------------------------------------------------------
 
@@ -825,7 +1169,10 @@ def _pf(home_team: str) -> dict:
 def build_feature_row(game: dict, pitchers: dict, batting: dict, game_logs: dict,
                       run_diffs: dict = None, weather_map: dict = None,
                       bp_ip_3d_map: dict = None, rolling_ops_map: dict = None,
-                      risp_map: dict = None) -> dict:
+                      risp_map: dict = None, il_transactions: dict = None,
+                      schedule_features: dict = None, win_streaks: dict = None,
+                      roster_hands: dict = None, bp_li_map: dict = None,
+                      umpire_map: dict = None, team_days_rest: dict = None) -> dict:
     home_sp = _sp(game.get("home_sp_id"), pitchers)
     away_sp = _sp(game.get("away_sp_id"), pitchers)
     home_b  = _team(game["home_team"], batting)
@@ -849,6 +1196,57 @@ def build_feature_row(game: dict, pitchers: dict, batting: dict, game_logs: dict
     home_risp = risp_map.get(game["home_team"], LEAGUE_AVG["risp_14d"]) if risp_map else home_b["avg"]
     away_risp = risp_map.get(game["away_team"], LEAGUE_AVG["risp_14d"]) if risp_map else away_b["avg"]
 
+    if il_transactions:
+        home_bp_il, home_st_il = get_il_counts(game["home_team"], date, il_transactions)
+        away_bp_il, away_st_il = get_il_counts(game["away_team"], date, il_transactions)
+    else:
+        home_bp_il = away_bp_il = int(LEAGUE_AVG["bp_il_ct"])
+        home_st_il = away_st_il = int(LEAGUE_AVG["starters_il"])
+
+    sched = schedule_features or {}
+    h_sched = sched.get((game["home_team"], date), {})
+    a_sched = sched.get((game["away_team"], date), {})
+    home_wpct   = h_sched.get("win_pct",      LEAGUE_AVG["win_pct"])
+    home_b2b    = h_sched.get("back_to_back", int(LEAGUE_AVG["back_to_back"]))
+    home_series = h_sched.get("series_game",  int(LEAGUE_AVG["series_game"]))
+    away_wpct   = a_sched.get("win_pct",      LEAGUE_AVG["win_pct"])
+    away_b2b    = a_sched.get("back_to_back", int(LEAGUE_AVG["back_to_back"]))
+    away_series = a_sched.get("series_game",  int(LEAGUE_AVG["series_game"]))
+
+    # Win/loss streaks
+    streaks = win_streaks or {}
+    home_streak = streaks.get((game["home_team"], date), int(LEAGUE_AVG["win_streak"]))
+    away_streak = streaks.get((game["away_team"], date), int(LEAGUE_AVG["win_streak"]))
+
+    # Team days of rest
+    drest = team_days_rest or {}
+    home_drest = drest.get((game["home_team"], date), int(LEAGUE_AVG["team_days_rest"]))
+    away_drest = drest.get((game["away_team"], date), int(LEAGUE_AVG["team_days_rest"]))
+
+    # Handedness match (opposing roster hand composition vs SP hand)
+    hands = roster_hands or {}
+    home_sp_data = pitchers.get(game.get("home_sp_id"), {})
+    away_sp_data = pitchers.get(game.get("away_sp_id"), {})
+    home_hand = home_sp_data.get("hand", "R")
+    away_hand = away_sp_data.get("hand", "R")
+    away_hands = hands.get(game["away_team"], {"l_pct": 0.45, "r_pct": 0.55})
+    home_hands = hands.get(game["home_team"], {"l_pct": 0.45, "r_pct": 0.55})
+    home_hand_match = away_hands["l_pct"] if home_hand == "L" else away_hands["r_pct"]
+    away_hand_match = home_hands["l_pct"] if away_hand == "L" else home_hands["r_pct"]
+
+    # Bullpen LI proxy
+    bp_li = bp_li_map or {}
+    home_bp_li_val = bp_li.get(game["home_team"], LEAGUE_AVG["bp_li"])
+    away_bp_li_val = bp_li.get(game["away_team"], LEAGUE_AVG["bp_li"])
+
+    # Umpire run factor (career avg runs / 9.0; in-memory cache in get_umpire_career_stats)
+    from fetchers.mlb_stats import get_umpire_career_stats as _get_ump_stats
+    _LEAGUE_AVG_RUNS = 9.0
+    ump_name = (umpire_map or {}).get(game["game_id"], "TBD")
+    _ump_stats = _get_ump_stats(ump_name) if ump_name and ump_name != "TBD" else {}
+    _avg_r = _ump_stats.get("avg_runs")
+    umpire_run_factor = round(float(_avg_r) / _LEAGUE_AVG_RUNS, 3) if _avg_r else LEAGUE_AVG["umpire_run_factor"]
+
     def _fip_bp(sp_stats):
         """Bullpen xERA proxy: SP xFIP * 1.05 (bullpen ERA typically slightly higher)."""
         return min(sp_stats.get("xfip", LEAGUE_AVG["sp_xfip"]) * 1.05, 7.0)
@@ -871,10 +1269,11 @@ def build_feature_row(game: dict, pitchers: dict, batting: dict, game_logs: dict
         "home_sp_exit_velo":     home_sp["avg_exit_velo"],
         "home_sp_spin":          home_sp["fastball_spin"],
         "home_sp_days_rest":     int(home_dr),
-        "home_sp_hand_match_pct":LEAGUE_AVG["sp_hand_match_pct"],
+        "home_sp_hand_match_pct":home_hand_match,
         "home_sp_bvp_woba":      LEAGUE_AVG["sp_bvp_woba"],
         "home_sp_era_l3":        h_era_l3,
         "home_sp_whip_l3":       h_whip_l3,
+        "home_sp_xera_delta":    round(float(home_sp["xera"]) - float(home_sp["fip"]), 3),
         # Away SP
         "away_sp_xera":          away_sp["xera"],
         "away_sp_fip":           away_sp["fip"],
@@ -887,38 +1286,51 @@ def build_feature_row(game: dict, pitchers: dict, batting: dict, game_logs: dict
         "away_sp_exit_velo":     away_sp["avg_exit_velo"],
         "away_sp_spin":          away_sp["fastball_spin"],
         "away_sp_days_rest":     int(away_dr),
-        "away_sp_hand_match_pct":LEAGUE_AVG["sp_hand_match_pct"],
+        "away_sp_hand_match_pct":away_hand_match,
         "away_sp_bvp_woba":      LEAGUE_AVG["sp_bvp_woba"],
         "away_sp_era_l3":        a_era_l3,
         "away_sp_whip_l3":       a_whip_l3,
+        "away_sp_xera_delta":    round(float(away_sp["xera"]) - float(away_sp["fip"]), 3),
         # Home BP
         "home_bp_xera":   _fip_bp(home_sp),
         "home_bp_ip_3d":  home_bip,
-        "home_bp_li":     LEAGUE_AVG["bp_li"],
-        "home_bp_il_ct":  int(LEAGUE_AVG["bp_il_ct"]),
+        "home_bp_li":     home_bp_li_val,
+        "home_bp_il_ct":  home_bp_il,
         # Away BP
         "away_bp_xera":   _fip_bp(away_sp),
         "away_bp_ip_3d":  away_bip,
-        "away_bp_li":     LEAGUE_AVG["bp_li"],
-        "away_bp_il_ct":  int(LEAGUE_AVG["bp_il_ct"]),
+        "away_bp_li":     away_bp_li_val,
+        "away_bp_il_ct":  away_bp_il,
         # Home lineup
-        "home_lineup_woba": home_b["woba"],
-        "home_ops_14d":     home_ops,
-        "home_risp_14d":    home_risp,
-        "home_starters_il": int(LEAGUE_AVG["starters_il"]),
-        "home_run_diff":    home_rd,
+        "home_lineup_woba":   home_b["woba"],
+        "home_ops_14d":       home_ops,
+        "home_risp_14d":      home_risp,
+        "home_starters_il":   home_st_il,
+        "home_run_diff":      home_rd,
+        "home_win_pct":           home_wpct,
+        "home_back_to_back":      home_b2b,
+        "home_series_game":       home_series,
+        "home_win_streak":        home_streak,
+        "home_team_days_rest":    home_drest,
         # Away lineup
-        "away_lineup_woba": away_b["woba"],
-        "away_ops_14d":     away_ops,
-        "away_risp_14d":    away_risp,
-        "away_starters_il": int(LEAGUE_AVG["starters_il"]),
-        "away_run_diff":    away_rd,
-        # Park / weather
-        "park_factor_runs": pf["runs"],
-        "park_factor_hr":   pf["hr"],
-        "wind_speed":       wx.get("wind_speed",   LEAGUE_AVG["wind_speed"]),
-        "wind_dir_deg":     wx.get("wind_dir_deg", LEAGUE_AVG["wind_dir_deg"]),
-        "temperature":      wx.get("temperature",  LEAGUE_AVG["temperature"]),
+        "away_lineup_woba":       away_b["woba"],
+        "away_ops_14d":           away_ops,
+        "away_risp_14d":          away_risp,
+        "away_starters_il":       away_st_il,
+        "away_run_diff":          away_rd,
+        "away_win_pct":           away_wpct,
+        "away_back_to_back":      away_b2b,
+        "away_series_game":       away_series,
+        "away_win_streak":        away_streak,
+        "away_team_days_rest":    away_drest,
+        # Park / weather / umpire
+        "park_factor_runs":       pf["runs"],
+        "park_factor_hr":         pf["hr"],
+        "wind_speed":             wx.get("wind_speed",   LEAGUE_AVG["wind_speed"]),
+        "wind_dir_deg":           wx.get("wind_dir_deg", LEAGUE_AVG["wind_dir_deg"]),
+        "temperature":            wx.get("temperature",  LEAGUE_AVG["temperature"]),
+        "umpire_run_factor":      umpire_run_factor,
+        "is_dome":                1 if game["home_team"] in DOME_TEAMS else 0,
     }
 
 
@@ -928,8 +1340,8 @@ def build_feature_row(game: dict, pitchers: dict, batting: dict, game_logs: dict
 
 def main():
     parser = argparse.ArgumentParser(description="Build MLB historical training data (v2)")
-    parser.add_argument("--seasons", default="2022,2023,2024",
-                        help="Comma-separated list of game seasons (default: 2022,2023,2024)")
+    parser.add_argument("--seasons", default="2019,2021,2022,2023,2024,2025",
+                        help="Comma-separated list of game seasons (default: 2019,2021,2022,2023,2024,2025)")
     args = parser.parse_args()
     seasons = [int(s.strip()) for s in args.seasons.split(",")]
 
@@ -975,6 +1387,34 @@ def main():
         logger.info("Fetching historical weather for season %d...", season)
         weather_map = fetch_weather_historical(season, games)
 
+        # NEW: IL transactions for starters_il / bp_il_ct
+        il_transactions = fetch_team_il_transactions(
+            season, set(all_pitcher_ids), team_id_map
+        )
+        logger.info("IL transactions loaded for %d teams in %d", len(il_transactions), season)
+
+        # NEW: schedule-based features (win%, back-to-back, series game#)
+        schedule_features = compute_schedule_features(games)
+        logger.info("Schedule features computed for %d team-date pairs", len(schedule_features))
+
+        # NEW: win/loss streak per (team, date)
+        win_streaks = compute_win_streaks(games)
+        logger.info("Win streaks computed for %d team-date pairs", len(win_streaks))
+
+        # NEW: team days of rest per (team, date)
+        team_days_rest_map = compute_team_days_rest(games)
+        logger.info("Team days rest computed for %d team-date pairs", len(team_days_rest_map))
+
+        # NEW: team roster handedness (for hand_match_pct)
+        roster_hands = fetch_team_roster_hands(season, team_id_map)
+
+        # NEW: bullpen LI proxy (saves/holds/blown saves)
+        bp_li_map = fetch_team_bp_li_season(season, team_id_map)
+
+        # NEW: umpire assignments
+        umpire_map = fetch_season_umpires(season)
+        logger.info("Umpires loaded for %d games in %d", len(umpire_map), season)
+
         # Batch-resolve names to warm name cache (avoids per-game API calls)
         ids_needed = {int(g[k]) for g in games for k in ("home_sp_id","away_sp_id") if g.get(k)}
         ids_missing = ids_needed - set(pitchers.keys())
@@ -988,7 +1428,14 @@ def main():
                                     run_diffs=run_diffs, weather_map=weather_map,
                                     bp_ip_3d_map=daily_bp_ip,
                                     rolling_ops_map=rolling_ops_map,
-                                    risp_map=risp_map)
+                                    risp_map=risp_map,
+                                    il_transactions=il_transactions,
+                                    schedule_features=schedule_features,
+                                    win_streaks=win_streaks,
+                                    roster_hands=roster_hands,
+                                    bp_li_map=bp_li_map,
+                                    umpire_map=umpire_map,
+                                    team_days_rest=team_days_rest_map)
             all_rows.append(row)
             hs, as_ = game["home_score"], game["away_score"]
             all_results.append({
@@ -1023,6 +1470,21 @@ def main():
 
     logger.info("Saved %d feature rows  -> %s", len(features_df), feat_path)
     logger.info("Saved %d result rows   -> %s", len(results_df),  result_path)
+
+    # Compute and save per-umpire avg runs from this dataset (used on next build + live pipeline)
+    import json as _json
+    all_ump_maps = {}
+    for _s in seasons:
+        all_ump_maps.update(_load(f"umpires_{_s}") or {})
+    game_totals = {r["game_id"]: r["total_runs"] for r in all_results}
+    ump_runs: dict[str, list] = {}
+    for gid, uname in all_ump_maps.items():
+        if uname and uname != "TBD" and gid in game_totals:
+            ump_runs.setdefault(uname, []).append(game_totals[gid])
+    ump_stats = {u: round(sum(runs)/len(runs), 2) for u, runs in ump_runs.items() if len(runs) >= 10}
+    ump_stats_path = DATA_DIR / "umpire_stats.json"
+    ump_stats_path.write_text(_json.dumps(ump_stats, indent=2))
+    logger.info("Umpire stats saved: %d umpires -> %s", len(ump_stats), ump_stats_path)
 
     # Coverage report
     n = len(features_df)

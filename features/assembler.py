@@ -1,5 +1,5 @@
 """
-Feature assembler — combines all data sources into the 49-column feature
+Feature assembler — combines all data sources into the 70-column feature
 vector required for XGBoost inference.
 
 Each game produces one row keyed by (game_id, cycle).
@@ -14,6 +14,7 @@ from typing import Any
 
 from config import (
     CURRENT_SEASON,
+    DOME_TEAMS,
     FEATURE_COLUMNS,
     LEAGUE_AVG,
     MISSING_FEATURE_THRESHOLD,
@@ -22,7 +23,12 @@ from config import (
 )
 from fetchers import fangraphs, mlb_stats, savant, weather as weather_fetcher
 from fetchers.fangraphs import get_pitcher_savant_extras
-from fetchers.mlb_stats import get_team_run_diff, get_pitcher_recent_form
+from fetchers.mlb_stats import (
+    get_team_run_diff, get_pitcher_recent_form,
+    get_team_win_pct, get_team_back_to_back, get_series_game_num,
+    get_team_win_streak, get_team_bp_li_proxy, get_team_lineup_hand_pct,
+    get_team_days_rest,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -98,19 +104,24 @@ def _compute_days_rest(pitcher_id: int, game_date: date) -> int:
 def _compute_hand_match_pct(
     pitcher_hand: str,
     batting_order: list[dict],
+    opp_team_id: int | None = None,
+    season: int = CURRENT_SEASON,
 ) -> float:
     """
-    Fraction of the batting order that bats the same side as the pitcher throws.
-    Platoon advantage runs the other way (opposite-hand batters do better),
-    but the raw match % is used as a raw signal; the model learns the direction.
+    Fraction of the opposing batting order that bats the same hand as the pitcher.
+    When no batting order is available, falls back to team roster handedness split.
     """
-    if not batting_order:
-        return LEAGUE_AVG["sp_hand_match_pct"]
-    same = sum(
-        1 for b in batting_order
-        if b.get("hand", "?") == pitcher_hand and b.get("hand", "?") != "?"
-    )
-    return round(same / len(batting_order), 4)
+    if batting_order:
+        known = [b for b in batting_order if b.get("hand", "?") != "?"]
+        if known:
+            same = sum(1 for b in known if b["hand"] == pitcher_hand)
+            return round(same / len(known), 4)
+
+    if opp_team_id:
+        hands = get_team_lineup_hand_pct(opp_team_id, season)
+        return hands["l_pct"] if pitcher_hand == "L" else hands["r_pct"]
+
+    return LEAGUE_AVG["sp_hand_match_pct"]
 
 
 # ---------------------------------------------------------------------------
@@ -122,9 +133,10 @@ def _build_pitcher_features(
     pitcher_id: int | None,
     pitcher_name: str,
     pitcher_hand: str,
-    batting_order: list[dict],
+    opp_batting_order: list[dict],
     game_date: date,
     season: int = CURRENT_SEASON,
+    opp_team_id: int | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
     """
     Returns (feature_dict, missing_feature_names).
@@ -193,8 +205,15 @@ def _build_pitcher_features(
         missing.append(f"{prefix}_era_l3")
         missing.append(f"{prefix}_whip_l3")
 
-    # Handedness match
-    feats[f"{prefix}_hand_match_pct"] = _compute_hand_match_pct(pitcher_hand, batting_order)
+    # xERA delta — regression-to-mean signal (positive = lucky, due for regression)
+    feats[f"{prefix}_xera_delta"] = round(
+        float(feats[f"{prefix}_xera"]) - float(feats[f"{prefix}_fip"]), 3
+    )
+
+    # Handedness match (pitcher vs opposing lineup)
+    feats[f"{prefix}_hand_match_pct"] = _compute_hand_match_pct(
+        pitcher_hand, opp_batting_order, opp_team_id=opp_team_id, season=season
+    )
 
     # BvP wOBA
     bvp = _BVP_TABLE.get(pitcher_id, None) if pitcher_id else None
@@ -235,9 +254,9 @@ def _build_bullpen_features(
     fg_bp = fangraphs.get_bullpen_workload(team_abbr, game_date, season, team_id=team_id)
     if fg_bp.get("_imputed"):
         missing.append(f"{prefix}_ip_3d")
-        missing.append(f"{prefix}_li")
     feats[f"{prefix}_ip_3d"] = fg_bp.get("bp_ip_3d", LEAGUE_AVG["bp_ip_3d"])
-    feats[f"{prefix}_li"]    = fg_bp.get("bp_li",    LEAGUE_AVG["bp_li"])
+    # LI proxy from MLB API saves/holds/blown saves (FanGraphs LI unavailable)
+    feats[f"{prefix}_li"] = get_team_bp_li_proxy(team_id, season)
 
     # Relievers on IL
     try:
@@ -263,6 +282,7 @@ def _build_lineup_features(
     game_date: date,
     batting_order: list[dict],
     season: int = CURRENT_SEASON,
+    opp_abbr: str = "",
 ) -> tuple[dict[str, Any], list[str]]:
     feats: dict[str, Any] = {}
     missing: list[str] = []
@@ -287,6 +307,15 @@ def _build_lineup_features(
 
     # Season-to-date run differential per game from accumulated results
     feats[f"{prefix}_run_diff"] = get_team_run_diff(team_abbr, game_date)
+
+    # Win%, back-to-back, series game#, win/loss streak — from DuckDB results table
+    feats[f"{prefix}_win_pct"]      = get_team_win_pct(team_abbr, game_date)
+    feats[f"{prefix}_back_to_back"] = get_team_back_to_back(team_abbr, game_date)
+    feats[f"{prefix}_series_game"]  = (
+        get_series_game_num(team_abbr, opp_abbr, game_date) if opp_abbr else int(LEAGUE_AVG["series_game"])
+    )
+    feats[f"{prefix}_win_streak"]      = get_team_win_streak(team_abbr, game_date)
+    feats[f"{prefix}_team_days_rest"]  = get_team_days_rest(team_abbr, game_date)
 
     return feats, missing
 
@@ -339,6 +368,7 @@ def _build_park_weather_features(
     feats["wind_dir"]     = wx["wind_dir"]       # stored in features table (text)
     feats["wind_dir_deg"] = wx["wind_dir_deg"]   # used by model
     feats["temperature"]  = wx["temperature"]
+    feats["is_dome"]      = 1 if home_team in DOME_TEAMS else 0
 
     return feats, missing
 
@@ -409,15 +439,18 @@ def assemble_game_features(
             pass
 
     # --- Build blocks ---
+    # home SP faces the away lineup; away SP faces the home lineup
     home_sp_feats, home_sp_missing = _build_pitcher_features(
         "home_sp", home_sp_id, home_sp_name, home_sp_hand,
-        home_lineup or [], game_date,
+        away_lineup or [], game_date,
+        opp_team_id=away_team_id,
     )
     all_missing.extend(home_sp_missing)
 
     away_sp_feats, away_sp_missing = _build_pitcher_features(
         "away_sp", away_sp_id, away_sp_name, away_sp_hand,
-        away_lineup or [], game_date,
+        home_lineup or [], game_date,
+        opp_team_id=home_team_id,
     )
     all_missing.extend(away_sp_missing)
 
@@ -433,11 +466,13 @@ def assemble_game_features(
 
     home_lu_feats, home_lu_missing = _build_lineup_features(
         "home", home_team, home_team_id, game_date, home_lineup or [],
+        opp_abbr=away_team,
     )
     all_missing.extend(home_lu_missing)
 
     away_lu_feats, away_lu_missing = _build_lineup_features(
         "away", away_team, away_team_id, game_date, away_lineup or [],
+        opp_abbr=home_team,
     )
     all_missing.extend(away_lu_missing)
 
@@ -445,6 +480,20 @@ def assemble_game_features(
         home_team, venue_name, game_datetime_utc, cycle,
     )
     all_missing.extend(park_wx_missing)
+
+    # --- Umpire run factor (career avg runs / 9.0 league avg) ---
+    umpire_run_factor = LEAGUE_AVG["umpire_run_factor"]
+    try:
+        ump_assignments = mlb_stats.get_umpire_assignments(game_date)
+        ump_info = ump_assignments.get(str(game_id), {})
+        ump_name = ump_info.get("name", "TBD")
+        if ump_name and ump_name != "TBD":
+            ump_stats = mlb_stats.get_umpire_career_stats(ump_name)
+            avg_runs = ump_stats.get("avg_runs")
+            if avg_runs:
+                umpire_run_factor = round(float(avg_runs) / 9.0, 3)
+    except Exception as exc:
+        logger.debug("umpire feature failed for game %s: %s", game_id, exc)
 
     # --- Combine ---
     row: dict[str, Any] = {
@@ -461,6 +510,7 @@ def assemble_game_features(
         park_wx_feats,
     ):
         row.update(block)
+    row["umpire_run_factor"] = umpire_run_factor
 
     # --- Missing-feature gate (AC-10 / Section 5.4) ---
     total_features = len(FEATURE_COLUMNS)

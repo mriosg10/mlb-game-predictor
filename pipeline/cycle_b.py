@@ -168,8 +168,29 @@ def run(game_date: date | None = None) -> dict[str, Any]:
             str(g["game_id"]): raw_ou.get(f"{g['away_team']}@{g['home_team']}")
             for g in games
         }
+        covered_live = sum(1 for v in game_ou_lines.values() if v is not None)
+
+        # Fallback: for games the Odds API has already dropped (game started),
+        # use the ou_line stored during Cycle A (fetched pre-game).
+        missing_ids = [gid for gid, v in game_ou_lines.items() if v is None]
+        if missing_ids:
+            try:
+                placeholders = ", ".join("?" * len(missing_ids))
+                with db.get_conn() as conn:
+                    rows = conn.execute(
+                        f"SELECT game_id, ou_line FROM predictions "
+                        f"WHERE game_id IN ({placeholders}) AND cycle = 'A' AND ou_line IS NOT NULL",
+                        missing_ids,
+                    ).fetchall()
+                for game_id, ou_line in rows:
+                    game_ou_lines[str(game_id)] = ou_line
+            except Exception as exc:
+                logger.warning("Cycle A ou_line fallback failed: %s", exc)
+
         covered = sum(1 for v in game_ou_lines.values() if v is not None)
-        logger.info("Cycle B: O/U lines fetched for %d/%d games", covered, len(games))
+        covered_fallback = covered - covered_live
+        logger.info("Cycle B: O/U lines — %d live, %d from Cycle A fallback, %d missing (of %d)",
+                    covered_live, covered_fallback, len(games) - covered, len(games))
 
         # ------------------------------------------------------------------
         # Step 3: Fetch confirmed lineups from RotoWire

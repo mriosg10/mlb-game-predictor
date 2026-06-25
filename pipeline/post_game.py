@@ -42,6 +42,21 @@ def run(game_date: date | None = None) -> dict[str, Any]:
     start_ts = time.monotonic()
     logger.info("=== Post-game starting for %s ===", date_str)
 
+    # Check for a prior successful run BEFORE any DB writes so the finally
+    # block doesn't detect the current run's own upsert as a "prior success".
+    prior_success = False
+    try:
+        with db.get_conn() as conn:
+            row = conn.execute(
+                "SELECT run_status FROM evaluation_log "
+                "WHERE log_date = ? AND cycle = 'post' "
+                "ORDER BY created_at DESC LIMIT 1",
+                [game_date],
+            ).fetchone()
+            prior_success = row is not None and row[0] == "SUCCESS"
+    except Exception:
+        pass
+
     status: dict[str, Any] = {
         "log_date":        game_date,
         "cycle":           "post",
@@ -147,21 +162,6 @@ def run(game_date: date | None = None) -> dict[str, Any]:
         db.upsert_eval_log(status)
 
     finally:
-        # Check if a prior run already notified with a SUCCESS for this date.
-        # If so, the retry is silent — don't send a duplicate email.
-        prior_success = False
-        try:
-            with db.get_conn() as conn:
-                row = conn.execute(
-                    "SELECT run_status FROM evaluation_log "
-                    "WHERE log_date = ? AND cycle = 'post' "
-                    "ORDER BY created_at DESC LIMIT 1",
-                    [game_date],
-                ).fetchone()
-                prior_success = row is not None and row[0] == "SUCCESS"
-        except Exception:
-            pass
-
         db.upsert_eval_log(status)
 
         if not prior_success:

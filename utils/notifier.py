@@ -660,7 +660,7 @@ def notify_retrain(metrics: dict) -> None:
         f"<td>{_fmt(ou_brier)}</td></tr>"
     ) if ou_trained else (
         "<tr><td style='padding:6px 16px 6px 0'><b>O/U model</b></td>"
-        "<td style='color:#888'>skipped (need ≥ 100 games with ou_line)</td></tr>"
+        "<td style='color:#888'>skipped (need ≥ 200 games with ou_line)</td></tr>"
     )
 
     body = f"""

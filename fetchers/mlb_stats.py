@@ -10,9 +10,10 @@ Empty or malformed responses are handled gracefully without hard-failing.
 """
 
 import logging
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
+import numpy as np
 import requests
 
 from config import MLB_API_BASE, HTTP_TIMEOUT
@@ -130,7 +131,7 @@ def get_il_transactions(team_id: int, game_date: date) -> list[dict]:
     Return IL placements/activations for the given team within the last 14 days.
     Used to count unavailable starters and bullpen arms.
     """
-    start = game_date.replace(day=max(1, game_date.day - 14))
+    start = game_date - timedelta(days=14)
     try:
         data = _get(
             "/transactions",
@@ -410,24 +411,47 @@ def get_team_rolling_batting(team_id: int, end_date: date, days: int = 14) -> di
         logger.debug("rolling OPS fetch failed for team %d: %s", team_id, exc)
         ops_14d = LEAGUE_AVG["ops_14d"]
 
+    risp_14d = LEAGUE_AVG["risp_14d"]
     try:
-        # RISP avg via statSplits
+        # Attempt true 14-day RISP via byDateRange + sitCodes
         risp_data = _get(
             f"/teams/{team_id}/stats",
             params={
-                "season":   CURRENT_SEASON,
-                "group":    "hitting",
-                "stats":    "statSplits",
-                "sitCodes": "RISP",
+                "season":    CURRENT_SEASON,
+                "group":     "hitting",
+                "stats":     "byDateRange",
+                "startDate": start_str,
+                "endDate":   end_str,
+                "sitCodes":  "RISP",
             },
         )
         risp_splits = risp_data.get("stats", [{}])[0].get("splits", [])
         risp_stat = risp_splits[0].get("stat", {}) if risp_splits else {}
         v = risp_stat.get("avg")
-        risp_14d = float(v) if v else LEAGUE_AVG["risp_14d"]
-    except Exception as exc:
-        logger.debug("RISP fetch failed for team %d: %s", team_id, exc)
-        risp_14d = LEAGUE_AVG["risp_14d"]
+        if v:
+            risp_14d = float(v)
+            logger.debug("RISP 14d from byDateRange for team %d: %.3f", team_id, risp_14d)
+        else:
+            raise ValueError("no avg in byDateRange+RISP response")
+    except Exception:
+        # Fall back to season-level RISP — still better than league average
+        try:
+            risp_data = _get(
+                f"/teams/{team_id}/stats",
+                params={
+                    "season":   CURRENT_SEASON,
+                    "group":    "hitting",
+                    "stats":    "statSplits",
+                    "sitCodes": "RISP",
+                },
+            )
+            risp_splits = risp_data.get("stats", [{}])[0].get("splits", [])
+            risp_stat = risp_splits[0].get("stat", {}) if risp_splits else {}
+            v = risp_stat.get("avg")
+            if v:
+                risp_14d = float(v)
+        except Exception as exc:
+            logger.debug("RISP fetch failed for team %d: %s", team_id, exc)
 
     result = {"ops_14d": ops_14d, "risp_14d": risp_14d}
     _rolling_batting_cache[cache_key] = result
@@ -464,6 +488,235 @@ def get_team_run_diff(team_abbr: str, up_to_date: date) -> float:
     except Exception as exc:
         logger.debug("run_diff DB query failed for %s: %s", team_abbr, exc)
     return float(LEAGUE_AVG["run_diff"])
+
+
+def get_team_win_pct(team_abbr: str, up_to_date: date) -> float:
+    """Season W-L win% for team_abbr in games before up_to_date, from DuckDB."""
+    from config import DB_PATH
+    try:
+        import duckdb
+        conn = duckdb.connect(DB_PATH, read_only=True)
+        row = conn.execute("""
+            SELECT
+                SUM(CASE WHEN (home_team = ? AND home_score > away_score)
+                              OR (away_team = ? AND away_score > home_score)
+                         THEN 1 ELSE 0 END) AS wins,
+                COUNT(*) AS games
+            FROM results
+            WHERE game_date < ?
+              AND (home_team = ? OR away_team = ?)
+        """, [team_abbr, team_abbr, up_to_date.strftime("%Y-%m-%d"),
+              team_abbr, team_abbr]).fetchone()
+        conn.close()
+        if row and row[1] and row[1] > 0:
+            return round(float(row[0] or 0) / float(row[1]), 4)
+    except Exception as exc:
+        logger.debug("win_pct DB query failed for %s: %s", team_abbr, exc)
+    return 0.500
+
+
+def get_team_back_to_back(team_abbr: str, game_date: date) -> int:
+    """1 if team played yesterday (per DuckDB results), 0 otherwise."""
+    from config import DB_PATH
+    from datetime import timedelta
+    yesterday = (game_date - timedelta(days=1)).strftime("%Y-%m-%d")
+    try:
+        import duckdb
+        conn = duckdb.connect(DB_PATH, read_only=True)
+        row = conn.execute("""
+            SELECT COUNT(*) FROM results
+            WHERE game_date = ?
+              AND (home_team = ? OR away_team = ?)
+        """, [yesterday, team_abbr, team_abbr]).fetchone()
+        conn.close()
+        return 1 if (row and row[0] > 0) else 0
+    except Exception as exc:
+        logger.debug("back_to_back DB query failed for %s: %s", team_abbr, exc)
+    return 0
+
+
+def get_team_days_rest(team_abbr: str, game_date: date) -> int:
+    """
+    Days since team_abbr last played before game_date (capped at 7).
+    Returns 1 for back-to-back, 2 for one day off, etc.  Defaults to 1.
+    """
+    from config import DB_PATH
+    try:
+        import duckdb
+        conn = duckdb.connect(DB_PATH, read_only=True)
+        row = conn.execute("""
+            SELECT MAX(game_date) FROM results
+            WHERE (home_team = ? OR away_team = ?)
+              AND game_date < ?
+        """, [team_abbr, team_abbr, game_date.strftime("%Y-%m-%d")]).fetchone()
+        conn.close()
+        if row and row[0]:
+            last = row[0]
+            if not isinstance(last, date):
+                from datetime import datetime as _dt
+                last = _dt.strptime(str(last), "%Y-%m-%d").date()
+            return min(int((game_date - last).days), 7)
+    except Exception as exc:
+        logger.debug("team_days_rest DB query failed for %s: %s", team_abbr, exc)
+    return 1
+
+
+def get_series_game_num(team_abbr: str, opp_abbr: str, game_date: date) -> int:
+    """
+    Series game number (1-based) for today's game between team_abbr and opp_abbr.
+    Counts consecutive prior days this matchup was played, going backward from yesterday.
+    """
+    from config import DB_PATH
+    from datetime import timedelta
+    try:
+        import duckdb
+        conn = duckdb.connect(DB_PATH, read_only=True)
+        rows = conn.execute("""
+            SELECT game_date FROM results
+            WHERE ((home_team = ? AND away_team = ?)
+                OR (home_team = ? AND away_team = ?))
+              AND game_date < ?
+            ORDER BY game_date DESC
+            LIMIT 7
+        """, [team_abbr, opp_abbr, opp_abbr, team_abbr,
+              game_date.strftime("%Y-%m-%d")]).fetchall()
+        conn.close()
+
+        check = game_date - timedelta(days=1)
+        count = 0
+        for (rdate,) in rows:
+            rd = rdate if isinstance(rdate, date) else datetime.strptime(str(rdate), "%Y-%m-%d").date()
+            if rd == check:
+                count += 1
+                check -= timedelta(days=1)
+            else:
+                break
+        return min(count + 1, 7)
+    except Exception as exc:
+        logger.debug("series_game DB query failed for %s vs %s: %s", team_abbr, opp_abbr, exc)
+    return 1
+
+
+# ---------------------------------------------------------------------------
+# Win/loss streak (from DuckDB results)
+# ---------------------------------------------------------------------------
+
+def get_team_win_streak(team_abbr: str, before_date: date) -> int:
+    """
+    Consecutive win (+N) or loss (-N) streak for team_abbr before before_date.
+    Caps at ±10. Returns 0 when no result history exists.
+    """
+    from config import DB_PATH
+    try:
+        import duckdb
+        conn = duckdb.connect(DB_PATH, read_only=True)
+        rows = conn.execute("""
+            SELECT home_team, away_team, home_score, away_score
+            FROM results
+            WHERE (home_team = $1 OR away_team = $1)
+              AND game_date < $2
+            ORDER BY game_date DESC
+            LIMIT 15
+        """, [team_abbr, before_date.strftime("%Y-%m-%d")]).fetchall()
+        conn.close()
+    except Exception as exc:
+        logger.debug("win_streak query failed for %s: %s", team_abbr, exc)
+        return 0
+
+    if not rows:
+        return 0
+
+    streak = 0
+    first_won: bool | None = None
+    for home, away, hs, as_ in rows:
+        won = (hs > as_) if home == team_abbr else (as_ > hs)
+        if first_won is None:
+            first_won = won
+        if won == first_won:
+            streak += 1
+        else:
+            break
+
+    direction = 1 if first_won else -1
+    return int(max(-10, min(10, direction * streak)))
+
+
+# ---------------------------------------------------------------------------
+# Bullpen leverage index proxy (from MLB Stats API saves/holds/blown saves)
+# ---------------------------------------------------------------------------
+
+_bp_li_proxy_cache: dict[tuple, float] = {}
+
+def get_team_bp_li_proxy(team_id: int, season: int) -> float:
+    """
+    Proxy for bullpen average leverage index.
+    (SV + HLD) / (SV + HLD + BS) normalised so league-average ≈ 1.0.
+    Falls back to LEAGUE_AVG when data is sparse.
+    """
+    from config import LEAGUE_AVG
+    cache_key = (team_id, season)
+    if cache_key in _bp_li_proxy_cache:
+        return _bp_li_proxy_cache[cache_key]
+    try:
+        data = _get(f"/teams/{team_id}/stats",
+                    params={"season": season, "group": "pitching", "stats": "season"})
+        splits = data.get("stats", [{}])[0].get("splits", [])
+        stat   = splits[0].get("stat", {}) if splits else {}
+        sv  = int(stat.get("saves",       0) or 0)
+        hld = int(stat.get("holds",       0) or 0)
+        bs  = int(stat.get("blownSaves",  0) or 0)
+        total = sv + hld + bs
+        if total < 10:
+            li = LEAGUE_AVG["bp_li"]
+        else:
+            ratio = (sv + hld) / total          # typical ~0.75 for average team
+            li = round(float(np.clip((ratio / 0.75) * LEAGUE_AVG["bp_li"], 0.5, 2.0)), 3)
+    except Exception as exc:
+        logger.debug("bp_li_proxy failed for team %d: %s", team_id, exc)
+        li = LEAGUE_AVG["bp_li"]
+    _bp_li_proxy_cache[cache_key] = li
+    return li
+
+
+# ---------------------------------------------------------------------------
+# Team lineup handedness split (from roster — used when no actual lineup)
+# ---------------------------------------------------------------------------
+
+_lineup_hand_cache: dict[tuple, dict] = {}
+
+def get_team_lineup_hand_pct(team_id: int, season: int) -> dict:
+    """
+    Returns {"l_pct": float, "r_pct": float} — fraction of active-roster position
+    players that bat left / right (switch hitters count as 0.5 each).
+    Used as a fallback for hand_match_pct when no actual batting order is available.
+    """
+    cache_key = (team_id, season)
+    if cache_key in _lineup_hand_cache:
+        return _lineup_hand_cache[cache_key]
+    defaults = {"l_pct": 0.45, "r_pct": 0.55}
+    try:
+        data = _get(f"/teams/{team_id}/roster",
+                    params={"rosterType": "active", "season": season})
+        l = r = s = 0
+        for p in data.get("roster", []):
+            if p.get("position", {}).get("abbreviation", "P") == "P":
+                continue
+            bats = p.get("person", {}).get("batSide", {}).get("code", "R")
+            if bats == "L":
+                l += 1
+            elif bats == "S":
+                s += 1
+            else:
+                r += 1
+        total = l + r + s
+        result = ({"l_pct": round((l + s * 0.5) / total, 3),
+                   "r_pct": round((r + s * 0.5) / total, 3)}
+                  if total > 0 else defaults)
+    except Exception as exc:
+        logger.debug("lineup_hand_pct failed for team %d: %s", team_id, exc)
+        result = defaults
+    _lineup_hand_cache[cache_key] = result
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -576,16 +829,43 @@ def get_umpire_assignments(game_date: date) -> dict:
     return result
 
 
+_LEAGUE_AVG_IMPACT = 1.45   # umpscorecards total_run_impact_mean league mean
+_LEAGUE_AVG_RUNS   = 9.0    # MLB avg total runs per game
+
 def get_umpire_career_stats(umpire_name: str) -> dict:
     """
-    Fetch career umpire stats from umpscorecards.com.
-    Returns {avg_runs, k_rate_pct, tendency} or {} on failure.
+    Return {avg_runs, tendency} for an HP umpire.
+
+    Priority:
+      1. Local data/umpire_stats.json (computed from historical game totals — best source)
+      2. umpscorecards.com API (total_run_impact_mean proxy — less accurate but available live)
+    Returns {} on failure (caller treats missing as league average).
     """
     if not umpire_name or umpire_name == "TBD":
         return {}
     if umpire_name in _umpire_stats_cache:
         return _umpire_stats_cache[umpire_name]
 
+    # 1. Local historical stats (built by build_training_data.py)
+    try:
+        import json as _json
+        from pathlib import Path as _Path
+        _stats_file = _Path(__file__).parent.parent / "data" / "umpire_stats.json"
+        if _stats_file.exists():
+            _local = _json.loads(_stats_file.read_text())
+            if umpire_name in _local:
+                avg_r = _local[umpire_name]
+                result = {
+                    "avg_runs": avg_r,
+                    "tendency": ("Favors Over" if avg_r > 9.5
+                                 else "Favors Under" if avg_r < 8.5 else "Neutral O/U"),
+                }
+                _umpire_stats_cache[umpire_name] = result
+                return result
+    except Exception:
+        pass
+
+    # 2. umpscorecards.com — response is {"rows": [...]} with "total_run_impact_mean"
     try:
         resp = requests.get(
             "https://umpscorecards.com/api/umpires/",
@@ -593,27 +873,23 @@ def get_umpire_career_stats(umpire_name: str) -> dict:
             headers={"User-Agent": "mlb-predictor/1.0"},
         )
         if resp.status_code == 200:
-            data = resp.json()
-            entries = data if isinstance(data, list) else data.get("umpires", [])
+            rows = resp.json().get("rows", [])
             name_lower = umpire_name.lower()
-            for ump in entries:
-                ump_name = (ump.get("name") or ump.get("umpire") or "").lower()
-                if not ump_name:
+            for ump in rows:
+                api_name = (ump.get("umpire") or "").lower()
+                if not api_name:
                     continue
-                if name_lower in ump_name or ump_name in name_lower:
-                    avg_r = float(ump.get("avg_runs", ump.get("runs_per_game", 0)) or 0)
-                    k_r   = float(ump.get("k_rate", ump.get("strikeout_rate", 0)) or 0)
-                    if k_r < 1:
-                        k_r *= 100  # convert fraction to pct if needed
-                    favor = ump.get("home_favor", ump.get("favor", 0)) or 0
-                    tend  = "Favors Over" if avg_r > 9.5 else ("Favors Under" if avg_r < 8.5 else "Neutral O/U")
-                    stats = {
-                        "avg_runs":   round(avg_r, 1),
-                        "k_rate_pct": round(k_r, 1),
-                        "tendency":   tend,
+                if name_lower in api_name or api_name in name_lower:
+                    impact = float(ump.get("total_run_impact_mean") or _LEAGUE_AVG_IMPACT)
+                    # Proxy: shift league avg runs by (impact - league_avg_impact)
+                    avg_r = round(_LEAGUE_AVG_RUNS + (impact - _LEAGUE_AVG_IMPACT), 2)
+                    result = {
+                        "avg_runs": avg_r,
+                        "tendency": ("Favors Over" if avg_r > 9.5
+                                     else "Favors Under" if avg_r < 8.5 else "Neutral O/U"),
                     }
-                    _umpire_stats_cache[umpire_name] = stats
-                    return stats
+                    _umpire_stats_cache[umpire_name] = result
+                    return result
     except Exception as exc:
         logger.debug("umpscorecards fetch failed for '%s': %s", umpire_name, exc)
 

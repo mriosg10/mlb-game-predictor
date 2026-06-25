@@ -69,12 +69,20 @@ def fetch_ou_lines(game_date: date) -> dict[str, float]:
         return {}
 
     url = f"{ODDS_API_BASE}/sports/baseball_mlb/odds"
+    # commenceTimeFrom/To: midnight ET (04:00 UTC) to 2 AM ET next day (06:00 UTC +1).
+    # This captures all games starting on game_date in ET and avoids next-day games
+    # bleeding into the response (which happens at Cycle B time ~17:30 UTC when
+    # afternoon games have left the feed and next-day games appear instead).
+    from_utc = f"{game_date.isoformat()}T04:00:00Z"
+    to_utc   = f"{(game_date + timedelta(days=1)).isoformat()}T06:00:00Z"
     params = {
-        "apiKey":      ODDS_API_KEY,
-        "regions":     "us",
-        "markets":     "totals",
-        "oddsFormat":  "american",
-        "dateFormat":  "iso",
+        "apiKey":             ODDS_API_KEY,
+        "regions":            "us",
+        "markets":            "totals",
+        "oddsFormat":         "american",
+        "dateFormat":         "iso",
+        "commenceTimeFrom":   from_utc,
+        "commenceTimeTo":     to_utc,
     }
 
     try:
@@ -85,9 +93,8 @@ def fetch_ou_lines(game_date: date) -> dict[str, float]:
         logger.warning("Odds API fetch failed: %s", exc)
         return {}
 
-    # The API returns all upcoming events; filter to game_date.
-    # Commence time is UTC ISO; EDT = UTC-4, so a game on date D can appear
-    # as date D or D+1 in UTC (late-night games). Accept both.
+    # The API returns events in the requested window; commence_time is UTC ISO.
+    # target_dates kept as a safety net for any edge cases in the window.
     target_dates = {game_date.isoformat(), (game_date + timedelta(days=1)).isoformat()}
 
     result: dict[str, float] = {}
@@ -106,7 +113,8 @@ def fetch_ou_lines(game_date: date) -> dict[str, float]:
         home_abbr = _TEAM_ABBR.get(home_full)
 
         if not away_abbr or not home_abbr:
-            logger.debug("Odds API: unrecognised team name(s): %s / %s", away_full, home_full)
+            logger.warning("Odds API: unrecognised team name(s): '%s' / '%s' — add to _TEAM_ABBR",
+                           away_full, home_full)
             continue
 
         key = f"{away_abbr}@{home_abbr}"

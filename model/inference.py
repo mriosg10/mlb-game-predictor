@@ -11,13 +11,18 @@ Two separate models are used:
 """
 
 import logging
+import os
+import pickle
 from typing import Any
 
 import numpy as np
 import pandas as pd
 import xgboost as xgb
 
-from config import FEATURE_COLUMNS, MODEL_VERSION, OU_FEATURE_COLUMNS, OU_MODEL_PATH, TOTAL_MODEL_PATH, WIN_MODEL_PATH
+from config import (
+    CALIBRATOR_PATH, FEATURE_COLUMNS, LEAGUE_AVG, MODEL_VERSION,
+    OU_FEATURE_COLUMNS, OU_MODEL_PATH, TOTAL_MODEL_PATH, WIN_MODEL_PATH,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +38,38 @@ class ModelNotFoundError(FileNotFoundError):
 _win_model:   xgb.Booster | None = None
 _total_model: xgb.Booster | None = None
 _ou_model:    xgb.Booster | None = None
+_calibrator:  Any = None  # IsotonicRegression, or None if artifact absent
+
+
+def _add_composite_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Mirror of train._add_composite_features — must stay in sync."""
+    df = df.copy()
+    df["sum_sp_era_l3"] = (
+        df.get("home_sp_era_l3", LEAGUE_AVG["sp_era_l3"]) +
+        df.get("away_sp_era_l3", LEAGUE_AVG["sp_era_l3"])
+    )
+    df["sum_ops_14d"]   = (
+        df.get("home_ops_14d", LEAGUE_AVG["ops_14d"]) +
+        df.get("away_ops_14d", LEAGUE_AVG["ops_14d"])
+    )
+    df["avg_sp_k_pct"]  = (
+        df.get("home_sp_k_pct", LEAGUE_AVG["sp_k_pct"]) +
+        df.get("away_sp_k_pct", LEAGUE_AVG["sp_k_pct"])
+    ) / 2
+    return df
+
+
+def _load_calibrator() -> Any:
+    """Load isotonic calibrator if artifact exists; returns None otherwise."""
+    global _calibrator
+    if _calibrator is not None:
+        return _calibrator
+    if not os.path.exists(CALIBRATOR_PATH):
+        return None
+    with open(CALIBRATOR_PATH, "rb") as f:
+        _calibrator = pickle.load(f)
+    logger.info("Calibrator loaded: %s", CALIBRATOR_PATH)
+    return _calibrator
 
 
 def load_ou_model() -> xgb.Booster | None:
@@ -134,6 +171,7 @@ def predict_game(
     """
     # Select and order feature columns; fill any unexpected NaN with column median
     df = pd.DataFrame([feature_row])
+    df = _add_composite_features(df)
 
     # Ensure all required columns exist; fill missing with 0 (should not happen
     # if assembler correctly gated on missing-feature threshold)
@@ -151,6 +189,10 @@ def predict_game(
 
     home_win_prob = float(win_model.predict(dmatrix)[0])
     predicted_total = float(total_model.predict(dmatrix)[0])
+
+    cal = _load_calibrator()
+    if cal is not None:
+        home_win_prob = float(cal.predict([home_win_prob])[0])
 
     home_win_prob   = float(np.clip(home_win_prob,   0.01, 0.99))
     predicted_total = float(np.clip(predicted_total,  0.0, 30.0))
@@ -175,6 +217,7 @@ def predict_batch(
         return []
 
     df = pd.DataFrame(feature_rows)
+    df = _add_composite_features(df)
 
     for col in FEATURE_COLUMNS:
         if col not in df.columns:
@@ -187,6 +230,10 @@ def predict_batch(
 
     win_probs   = win_model.predict(dmatrix)
     total_preds = total_model.predict(dmatrix)
+
+    cal = _load_calibrator()
+    if cal is not None:
+        win_probs = cal.predict(win_probs)
 
     results = []
     for i, row in enumerate(feature_rows):

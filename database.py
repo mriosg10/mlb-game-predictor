@@ -162,10 +162,24 @@ def get_conn():
 
 
 _FEATURES_MIGRATIONS = [
-    "ALTER TABLE features ADD COLUMN IF NOT EXISTS home_sp_era_l3  FLOAT",
-    "ALTER TABLE features ADD COLUMN IF NOT EXISTS home_sp_whip_l3 FLOAT",
-    "ALTER TABLE features ADD COLUMN IF NOT EXISTS away_sp_era_l3  FLOAT",
-    "ALTER TABLE features ADD COLUMN IF NOT EXISTS away_sp_whip_l3 FLOAT",
+    "ALTER TABLE features ADD COLUMN IF NOT EXISTS home_sp_era_l3    FLOAT",
+    "ALTER TABLE features ADD COLUMN IF NOT EXISTS home_sp_whip_l3   FLOAT",
+    "ALTER TABLE features ADD COLUMN IF NOT EXISTS away_sp_era_l3    FLOAT",
+    "ALTER TABLE features ADD COLUMN IF NOT EXISTS away_sp_whip_l3   FLOAT",
+    "ALTER TABLE features ADD COLUMN IF NOT EXISTS home_win_pct       FLOAT",
+    "ALTER TABLE features ADD COLUMN IF NOT EXISTS away_win_pct       FLOAT",
+    "ALTER TABLE features ADD COLUMN IF NOT EXISTS home_back_to_back  INT",
+    "ALTER TABLE features ADD COLUMN IF NOT EXISTS away_back_to_back  INT",
+    "ALTER TABLE features ADD COLUMN IF NOT EXISTS home_series_game   INT",
+    "ALTER TABLE features ADD COLUMN IF NOT EXISTS away_series_game   INT",
+    "ALTER TABLE features ADD COLUMN IF NOT EXISTS home_win_streak       INT",
+    "ALTER TABLE features ADD COLUMN IF NOT EXISTS away_win_streak       INT",
+    "ALTER TABLE features ADD COLUMN IF NOT EXISTS umpire_run_factor     FLOAT",
+    "ALTER TABLE features ADD COLUMN IF NOT EXISTS home_team_days_rest   INT",
+    "ALTER TABLE features ADD COLUMN IF NOT EXISTS away_team_days_rest   INT",
+    "ALTER TABLE features ADD COLUMN IF NOT EXISTS home_sp_xera_delta    FLOAT",
+    "ALTER TABLE features ADD COLUMN IF NOT EXISTS away_sp_xera_delta    FLOAT",
+    "ALTER TABLE features ADD COLUMN IF NOT EXISTS is_dome               INT",
 ]
 
 _PREDICTIONS_MIGRATIONS = [
