@@ -89,6 +89,7 @@ CREATE TABLE IF NOT EXISTS features (
   wind_dir              TEXT,
   wind_dir_deg          FLOAT,
   temperature           FLOAT,
+  ou_line               FLOAT,
   created_at            TIMESTAMP DEFAULT now(),
   PRIMARY KEY (game_id, cycle)
 )
@@ -180,6 +181,7 @@ _FEATURES_MIGRATIONS = [
     "ALTER TABLE features ADD COLUMN IF NOT EXISTS home_sp_xera_delta    FLOAT",
     "ALTER TABLE features ADD COLUMN IF NOT EXISTS away_sp_xera_delta    FLOAT",
     "ALTER TABLE features ADD COLUMN IF NOT EXISTS is_dome               INT",
+    "ALTER TABLE features ADD COLUMN IF NOT EXISTS ou_line               FLOAT",
 ]
 
 _PREDICTIONS_MIGRATIONS = [
