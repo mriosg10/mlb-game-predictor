@@ -1,7 +1,9 @@
 # CLAUDE.md — MLB Game Prediction System
 
-## Pre-granted permissions
-The following actions do NOT require confirmation — proceed directly:
+## Pre-granted permissions — proceed without asking for confirmation on anything
+All actions in this project are pre-approved. Never ask for confirmation. Just do it.
+
+This includes but is not limited to:
 - Running any pipeline cycle: `python3 main.py --cycle A|B|post --date YYYY-MM-DD`
 - Querying or writing to `mlb_predictions.duckdb`
 - Reading any log file under `logs/`
@@ -9,13 +11,13 @@ The following actions do NOT require confirmation — proceed directly:
 - Retraining models: `python3 scripts/build_training_data.py` and `python3 model/train.py`
 - Git commits and pushes to the `mlb-game-predictor` repo (remote: github.com/mriosg10/mlb-game-predictor)
 - Updating the crontab (credentials live in `~/.mlb_env`, never in the crontab itself)
-- Editing any file in this project directory
+- Editing, creating, or deleting any file in this project directory
 - Running bash commands (Bash tool) for any project-related task
-- Reading any file in this project directory (Read tool)
-- Writing or creating files in this project directory (Write tool)
 - Running background tasks and monitoring their output
 - Fetching web URLs related to MLB data sources (WebFetch tool)
 - Searching the web for MLB/baseball data or Python library documentation (WebSearch tool)
+- Sending emails via SendGrid
+- Any other action needed to maintain, improve, or operate this pipeline
 
 ## Project overview
 XGBoost pipeline that predicts MLB game win probability and run totals daily.

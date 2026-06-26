@@ -451,7 +451,9 @@ def train_ou_model(
         logger.warning("OU model training skipped — 'ou_line' column missing in %s", ou_path)
         return _no_model()
 
-    df = features_df.merge(ou_df[["game_id", "ou_line"]], on="game_id", how="inner")
+    # Drop LEAGUE_AVG ou_line default before joining real market lines
+    base = features_df.drop(columns=["ou_line"], errors="ignore")
+    df = base.merge(ou_df[["game_id", "ou_line"]], on="game_id", how="inner")
     if df.empty:
         logger.warning("OU model training skipped — no games matched after join")
         return _no_model()
