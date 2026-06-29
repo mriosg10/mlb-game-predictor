@@ -77,7 +77,8 @@ def compute_daily_metrics(
     win_acc = float(pred_winner_correct.mean())
 
     # Run total MAE
-    mae = float(np.mean(np.abs(df["predicted_total"].values - df["total_runs"].values)))
+    mae_df = df.dropna(subset=["predicted_total", "total_runs"])
+    mae = float(np.mean(np.abs(mae_df["predicted_total"].values - mae_df["total_runs"].values))) if not mae_df.empty else float("nan")
 
     logger.info(
         "Metrics for %s cycle=%s: n=%d  Brier=%.4f  WinAcc=%.3f  MAE=%.3f",
@@ -121,9 +122,10 @@ def compute_rolling_metrics(days: int = 14) -> dict[str, Any]:
         win_acc = float(
             ((pred_hw >= 0.5) == (actual_hw == 1.0)).mean()
         )
+        mae_subset = subset.dropna(subset=["predicted_total", "total_runs"])
         mae = float(
-            np.mean(np.abs(subset["predicted_total"].values - subset["total_runs"].values))
-        )
+            np.mean(np.abs(mae_subset["predicted_total"].values - mae_subset["total_runs"].values))
+        ) if not mae_subset.empty else float("nan")
         metrics[f"cycle_{label}_brier"]      = round(brier, 6)
         metrics[f"cycle_{label}_win_accuracy"]= round(win_acc, 6)
         metrics[f"cycle_{label}_mae"]        = round(mae, 6)

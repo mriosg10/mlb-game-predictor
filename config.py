@@ -57,7 +57,7 @@ HTTP_TIMEOUT = 30      # seconds per request
 
 # Post-game actuals: more aggressive retry because games end late
 POSTgame_RETRIES = 6
-POSTAGE_BACKOFF_BASE = 20  # 20s / 40s / 80s / 160s / 320s / 640s
+POSTGAME_BACKOFF_BASE = 20  # 20s / 40s / 80s / 160s / 320s / 640s
 
 # RotoWire scrape: longer delay between retries (rate-limit avoidance)
 ROTOWIRE_RETRIES = 3

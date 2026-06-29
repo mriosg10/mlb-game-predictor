@@ -16,7 +16,7 @@ from typing import Any
 import numpy as np
 import requests
 
-from config import MLB_API_BASE, HTTP_TIMEOUT
+from config import MLB_API_BASE, HTTP_TIMEOUT, POSTgame_RETRIES, POSTGAME_BACKOFF_BASE
 from utils.retry import retry_with_backoff
 
 logger = logging.getLogger(__name__)
@@ -111,6 +111,23 @@ def get_player(player_id: int) -> dict:
     }
 
 
+@retry_with_backoff(retries=2, backoff_base=2, exceptions=_TRANSIENT_ERRORS)
+def search_player_by_name(full_name: str) -> int | None:
+    """Return MLBAM ID for the first pitcher matching full_name, or None."""
+    try:
+        data = _get("/people/search", params={"names": full_name, "sportId": 1})
+        people = data.get("people", [])
+        if not people:
+            return None
+        for p in people:
+            if p.get("primaryPosition", {}).get("type") == "Pitcher":
+                return int(p["id"])
+        return int(people[0]["id"])
+    except Exception as exc:
+        logger.warning("Player search failed for '%s': %s", full_name, exc)
+        return None
+
+
 def get_players_bulk(player_ids: list[int]) -> dict[int, dict]:
     """Fetch multiple players; skips failures and returns partial results."""
     result = {}
@@ -171,7 +188,7 @@ def count_il_players(team_id: int, game_date: date, position_filter: str | None 
         # IL placement codes
         if type_code in ("IL10", "IL15", "IL60", "SUSP", "BRV"):
             on_il.add(pid)
-        elif type_code in ("CRA", "REL"):  # activated / reinstated
+        elif type_code in ("REA", "ACT"):  # reinstated / activated
             on_il.discard(pid)
 
     if position_filter is None or not on_il:
@@ -193,6 +210,8 @@ def count_il_players(team_id: int, game_date: date, position_filter: str | None 
 # Final scores
 # ---------------------------------------------------------------------------
 
+@retry_with_backoff(retries=POSTgame_RETRIES, backoff_base=POSTGAME_BACKOFF_BASE,
+                    exceptions=_TRANSIENT_ERRORS)
 def get_final_scores(game_date: date) -> list[dict]:
     """
     Return final scores for all games on game_date.
@@ -330,13 +349,16 @@ def get_pitcher_recent_form(pitcher_id: int, game_date: date, n_starts: int = 3)
         total_h  = sum(s["stat"].get("hits", 0) for s in recent)
         total_bb = sum(s["stat"].get("baseOnBalls", 0) for s in recent)
 
-        # Parse innings pitched (e.g. "6.2" = 6 and 2/3 innings)
+        # Parse innings pitched (e.g. "6.2" = 6⅔; "9" = complete game)
         total_ip = 0.0
         for s in recent:
             ip_str = str(s["stat"].get("inningsPitched", "0.0"))
             try:
-                whole, thirds = ip_str.split(".")
-                total_ip += int(whole) + int(thirds) / 3
+                if "." in ip_str:
+                    whole, thirds = ip_str.split(".", 1)
+                    total_ip += int(whole) + int(thirds[:1]) / 3
+                else:
+                    total_ip += float(ip_str)
             except Exception:
                 pass
 
@@ -470,19 +492,18 @@ def get_team_run_diff(team_abbr: str, up_to_date: date) -> float:
     from config import DB_PATH, LEAGUE_AVG
     try:
         import duckdb
-        conn = duckdb.connect(DB_PATH, read_only=True)
-        row = conn.execute("""
-            SELECT
-                SUM(CASE WHEN home_team = ? THEN home_score - away_score
-                         WHEN away_team = ? THEN away_score - home_score
-                         ELSE 0 END)                AS total_diff,
-                COUNT(*)                            AS games
-            FROM results
-            WHERE game_date < ?
-              AND (home_team = ? OR away_team = ?)
-        """, [team_abbr, team_abbr, up_to_date.strftime("%Y-%m-%d"),
-              team_abbr, team_abbr]).fetchone()
-        conn.close()
+        with duckdb.connect(DB_PATH, read_only=True) as conn:
+            row = conn.execute("""
+                SELECT
+                    SUM(CASE WHEN home_team = ? THEN home_score - away_score
+                             WHEN away_team = ? THEN away_score - home_score
+                             ELSE 0 END)                AS total_diff,
+                    COUNT(*)                            AS games
+                FROM results
+                WHERE game_date < ?
+                  AND (home_team = ? OR away_team = ?)
+            """, [team_abbr, team_abbr, up_to_date.strftime("%Y-%m-%d"),
+                  team_abbr, team_abbr]).fetchone()
         if row and row[1] and row[1] > 0:
             return round(float(row[0]) / float(row[1]), 3)
     except Exception as exc:
@@ -495,19 +516,18 @@ def get_team_win_pct(team_abbr: str, up_to_date: date) -> float:
     from config import DB_PATH
     try:
         import duckdb
-        conn = duckdb.connect(DB_PATH, read_only=True)
-        row = conn.execute("""
-            SELECT
-                SUM(CASE WHEN (home_team = ? AND home_score > away_score)
-                              OR (away_team = ? AND away_score > home_score)
-                         THEN 1 ELSE 0 END) AS wins,
-                COUNT(*) AS games
-            FROM results
-            WHERE game_date < ?
-              AND (home_team = ? OR away_team = ?)
-        """, [team_abbr, team_abbr, up_to_date.strftime("%Y-%m-%d"),
-              team_abbr, team_abbr]).fetchone()
-        conn.close()
+        with duckdb.connect(DB_PATH, read_only=True) as conn:
+            row = conn.execute("""
+                SELECT
+                    SUM(CASE WHEN (home_team = ? AND home_score > away_score)
+                                  OR (away_team = ? AND away_score > home_score)
+                             THEN 1 ELSE 0 END) AS wins,
+                    COUNT(*) AS games
+                FROM results
+                WHERE game_date < ?
+                  AND (home_team = ? OR away_team = ?)
+            """, [team_abbr, team_abbr, up_to_date.strftime("%Y-%m-%d"),
+                  team_abbr, team_abbr]).fetchone()
         if row and row[1] and row[1] > 0:
             return round(float(row[0] or 0) / float(row[1]), 4)
     except Exception as exc:
@@ -522,13 +542,12 @@ def get_team_back_to_back(team_abbr: str, game_date: date) -> int:
     yesterday = (game_date - timedelta(days=1)).strftime("%Y-%m-%d")
     try:
         import duckdb
-        conn = duckdb.connect(DB_PATH, read_only=True)
-        row = conn.execute("""
-            SELECT COUNT(*) FROM results
-            WHERE game_date = ?
-              AND (home_team = ? OR away_team = ?)
-        """, [yesterday, team_abbr, team_abbr]).fetchone()
-        conn.close()
+        with duckdb.connect(DB_PATH, read_only=True) as conn:
+            row = conn.execute("""
+                SELECT COUNT(*) FROM results
+                WHERE game_date = ?
+                  AND (home_team = ? OR away_team = ?)
+            """, [yesterday, team_abbr, team_abbr]).fetchone()
         return 1 if (row and row[0] > 0) else 0
     except Exception as exc:
         logger.debug("back_to_back DB query failed for %s: %s", team_abbr, exc)
@@ -543,13 +562,12 @@ def get_team_days_rest(team_abbr: str, game_date: date) -> int:
     from config import DB_PATH
     try:
         import duckdb
-        conn = duckdb.connect(DB_PATH, read_only=True)
-        row = conn.execute("""
-            SELECT MAX(game_date) FROM results
-            WHERE (home_team = ? OR away_team = ?)
-              AND game_date < ?
-        """, [team_abbr, team_abbr, game_date.strftime("%Y-%m-%d")]).fetchone()
-        conn.close()
+        with duckdb.connect(DB_PATH, read_only=True) as conn:
+            row = conn.execute("""
+                SELECT MAX(game_date) FROM results
+                WHERE (home_team = ? OR away_team = ?)
+                  AND game_date < ?
+            """, [team_abbr, team_abbr, game_date.strftime("%Y-%m-%d")]).fetchone()
         if row and row[0]:
             last = row[0]
             if not isinstance(last, date):
@@ -570,17 +588,16 @@ def get_series_game_num(team_abbr: str, opp_abbr: str, game_date: date) -> int:
     from datetime import timedelta
     try:
         import duckdb
-        conn = duckdb.connect(DB_PATH, read_only=True)
-        rows = conn.execute("""
-            SELECT game_date FROM results
-            WHERE ((home_team = ? AND away_team = ?)
-                OR (home_team = ? AND away_team = ?))
-              AND game_date < ?
-            ORDER BY game_date DESC
-            LIMIT 7
-        """, [team_abbr, opp_abbr, opp_abbr, team_abbr,
-              game_date.strftime("%Y-%m-%d")]).fetchall()
-        conn.close()
+        with duckdb.connect(DB_PATH, read_only=True) as conn:
+            rows = conn.execute("""
+                SELECT game_date FROM results
+                WHERE ((home_team = ? AND away_team = ?)
+                    OR (home_team = ? AND away_team = ?))
+                  AND game_date < ?
+                ORDER BY game_date DESC
+                LIMIT 7
+            """, [team_abbr, opp_abbr, opp_abbr, team_abbr,
+                  game_date.strftime("%Y-%m-%d")]).fetchall()
 
         check = game_date - timedelta(days=1)
         count = 0
@@ -609,16 +626,15 @@ def get_team_win_streak(team_abbr: str, before_date: date) -> int:
     from config import DB_PATH
     try:
         import duckdb
-        conn = duckdb.connect(DB_PATH, read_only=True)
-        rows = conn.execute("""
-            SELECT home_team, away_team, home_score, away_score
-            FROM results
-            WHERE (home_team = $1 OR away_team = $1)
-              AND game_date < $2
-            ORDER BY game_date DESC
-            LIMIT 15
-        """, [team_abbr, before_date.strftime("%Y-%m-%d")]).fetchall()
-        conn.close()
+        with duckdb.connect(DB_PATH, read_only=True) as conn:
+            rows = conn.execute("""
+                SELECT home_team, away_team, home_score, away_score
+                FROM results
+                WHERE (home_team = $1 OR away_team = $1)
+                  AND game_date < $2
+                ORDER BY game_date DESC
+                LIMIT 15
+            """, [team_abbr, before_date.strftime("%Y-%m-%d")]).fetchall()
     except Exception as exc:
         logger.debug("win_streak query failed for %s: %s", team_abbr, exc)
         return 0
@@ -909,16 +925,15 @@ def get_team_recent_record(team_abbr: str, before_date: date, n: int = 10) -> di
     from config import DB_PATH
     try:
         import duckdb
-        conn = duckdb.connect(DB_PATH, read_only=True)
-        rows = conn.execute("""
-            SELECT home_team, away_team, home_score, away_score
-            FROM results
-            WHERE (home_team = $1 OR away_team = $1)
-              AND game_date < $2
-            ORDER BY game_date DESC
-            LIMIT $3
-        """, [team_abbr, before_date.strftime("%Y-%m-%d"), n]).fetchall()
-        conn.close()
+        with duckdb.connect(DB_PATH, read_only=True) as conn:
+            rows = conn.execute("""
+                SELECT home_team, away_team, home_score, away_score
+                FROM results
+                WHERE (home_team = $1 OR away_team = $1)
+                  AND game_date < $2
+                ORDER BY game_date DESC
+                LIMIT $3
+            """, [team_abbr, before_date.strftime("%Y-%m-%d"), n]).fetchall()
     except Exception as exc:
         logger.debug("recent record query failed for %s: %s", team_abbr, exc)
         return {}

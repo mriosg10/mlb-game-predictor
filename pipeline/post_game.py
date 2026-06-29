@@ -153,13 +153,10 @@ def run(game_date: date | None = None) -> dict[str, Any]:
             "games_evaluated": written,
             "failure_reason":  "; ".join(errors) if errors else None,
         })
-        # Update post-game log record
-        db.upsert_eval_log(status)
 
     except Exception as exc:
         logger.exception("Post-game unexpected failure: %s", exc)
         status["failure_reason"] = f"Unexpected error: {exc}"
-        db.upsert_eval_log(status)
 
     finally:
         db.upsert_eval_log(status)

@@ -200,8 +200,11 @@ def init_db() -> None:
         for stmt in _FEATURES_MIGRATIONS + _PREDICTIONS_MIGRATIONS:
             try:
                 conn.execute(stmt)
-            except Exception:
-                pass
+            except duckdb.CatalogException:
+                pass  # Column already exists — safe to ignore
+            except Exception as exc:
+                logger.warning("Migration failed: %.80s — %s", stmt, exc)
+                raise
     logger.info("Database schema initialised at %s", DB_PATH)
 
 

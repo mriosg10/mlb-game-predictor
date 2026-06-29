@@ -52,6 +52,7 @@ def _safe_import_pybaseball():
 _bref_pitcher_cache: dict[int, pd.DataFrame] = {}
 _savant_expected_cache: dict[int, pd.DataFrame] = {}
 _spin_cache: dict[int, pd.DataFrame] = {}
+_contact_cache: dict[int, pd.DataFrame] = {}
 
 
 def _load_bref_pitchers(season: int) -> pd.DataFrame:
@@ -160,6 +161,32 @@ def _load_spin_data(season: int) -> pd.DataFrame:
     return df
 
 
+def _load_contact_data(season: int) -> pd.DataFrame:
+    """Load season-aggregate barrel%, hard-hit%, and exit velo from Statcast."""
+    if season in _contact_cache:
+        return _contact_cache[season]
+
+    pb = _safe_import_pybaseball()
+    if pb is None:
+        return pd.DataFrame()
+
+    try:
+        df = pb.statcast_pitcher_exitvelo_barrels(season, minBBE=20)
+    except Exception as exc:
+        logger.warning("statcast_pitcher_exitvelo_barrels(%d) failed: %s", season, exc)
+        return pd.DataFrame()
+
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    df["player_id"] = pd.to_numeric(df["player_id"], errors="coerce")
+    df = df.dropna(subset=["player_id"])
+    df["player_id"] = df["player_id"].astype(int)
+
+    _contact_cache[season] = df
+    return df
+
+
 # ---------------------------------------------------------------------------
 # Public: pitcher features
 # ---------------------------------------------------------------------------
@@ -199,12 +226,11 @@ def get_pitcher_fangraphs(
         if not match.empty:
             row = match.iloc[0]
 
+    # Full-name exact match only — last-name-only search is too risky (e.g. "Garcia"
+    # matches multiple pitchers) and produces silently wrong features.
     if row is None and pitcher_name and not bref.empty and "Name" in bref.columns:
         name_clean = pitcher_name.strip().lower()
         name_match = bref[bref["Name"].str.strip().str.lower() == name_clean]
-        if name_match.empty:
-            last = name_clean.split()[-1]
-            name_match = bref[bref["Name"].str.lower().str.contains(last, na=False)]
         if not name_match.empty:
             row = name_match.iloc[0]
 
@@ -239,8 +265,8 @@ def get_pitcher_savant_extras(
     season: int = CURRENT_SEASON,
 ) -> dict[str, float]:
     """
-    Return xERA and fastball spin rate from Baseball Savant.
-    Both are indexed by MLBAM pitcher_id.
+    Return xERA, fastball spin, barrel%, hard-hit%, and avg exit velo from
+    Baseball Savant season-aggregate tables (lightweight; no pitch-by-pitch).
     """
     cache_key = (pitcher_id, season)
     if cache_key in _savant_pitcher_cache:
@@ -249,6 +275,9 @@ def get_pitcher_savant_extras(
     defaults = {
         "xera":          LEAGUE_AVG["sp_xera"],
         "fastball_spin": LEAGUE_AVG["sp_spin"],
+        "barrel_pct":    LEAGUE_AVG["sp_barrel"],
+        "hard_hit_pct":  LEAGUE_AVG["sp_hh_pct"],
+        "avg_exit_velo": LEAGUE_AVG["sp_exit_velo"],
         "_imputed":      True,
     }
     if not pitcher_id:
@@ -280,10 +309,42 @@ def get_pitcher_savant_extras(
                 except (TypeError, ValueError):
                     pass
 
+    # Barrel%, hard-hit%, exit velo from season-aggregate contact table
+    contact_df = _load_contact_data(season)
+    barrel_pct    = LEAGUE_AVG["sp_barrel"]
+    hard_hit_pct  = LEAGUE_AVG["sp_hh_pct"]
+    avg_exit_velo = LEAGUE_AVG["sp_exit_velo"]
+    if not contact_df.empty:
+        match = contact_df[contact_df["player_id"] == pitcher_id]
+        if not match.empty:
+            row = match.iloc[0]
+            def _g(col, fallback):
+                v = row.get(col)
+                try:
+                    return float(v) if v is not None else fallback
+                except (TypeError, ValueError):
+                    return fallback
+            brl = _g("brl_percent", barrel_pct * 100) / 100.0
+            hh  = _g("ev95percent", hard_hit_pct * 100) / 100.0
+            ev  = _g("avg_hit_speed", avg_exit_velo)
+            if brl > 1.0: brl /= 100.0
+            if hh  > 1.0: hh  /= 100.0
+            barrel_pct    = float(np.clip(brl, 0.0, 0.25))
+            hard_hit_pct  = float(np.clip(hh,  0.0, 0.70))
+            avg_exit_velo = float(np.clip(ev,  70.0, 105.0))
+
+    any_imputed = (
+        xera == LEAGUE_AVG["sp_xera"]
+        and spin == LEAGUE_AVG["sp_spin"]
+        and barrel_pct == LEAGUE_AVG["sp_barrel"]
+    )
     result = {
         "xera":          xera,
         "fastball_spin": spin,
-        "_imputed":      xera == LEAGUE_AVG["sp_xera"] and spin == LEAGUE_AVG["sp_spin"],
+        "barrel_pct":    barrel_pct,
+        "hard_hit_pct":  hard_hit_pct,
+        "avg_exit_velo": avg_exit_velo,
+        "_imputed":      any_imputed,
     }
     _savant_pitcher_cache[cache_key] = result
     return result
@@ -306,7 +367,7 @@ def get_bullpen_workload(
     Returns estimated bullpen IP last 3 days and average leverage index.
     FanGraphs leverage index is unavailable; IP proxy is derived from bref.
     """
-    cache_key = ("bullpen", team_abbr, season)
+    cache_key = ("bullpen", team_abbr, season, str(end_date))
     if cache_key in _bullpen_cache:
         return _bullpen_cache[cache_key]
 
@@ -476,7 +537,7 @@ _park_factor_cache: dict[int, dict[str, dict]] = {}
 _FANGRAPHS_GUTS_URL = "https://www.fangraphs.com/guts.aspx?type=pf&teamid=0&season={year}"
 
 
-@retry_with_backoff(retries=3, backoff_base=2, exceptions=_TRANSIENT + (Exception,))
+@retry_with_backoff(retries=3, backoff_base=2, exceptions=_TRANSIENT)
 def _scrape_park_factors(season: int) -> dict[str, dict]:
     from bs4 import BeautifulSoup
     url = _FANGRAPHS_GUTS_URL.format(year=season)
@@ -488,6 +549,8 @@ def _scrape_park_factors(season: int) -> dict[str, dict]:
         )
     }
     resp = requests.get(url, headers=headers, timeout=HTTP_TIMEOUT)
+    if resp.status_code == 403:
+        raise RuntimeError("FanGraphs returned 403 — blocked; will not retry")
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "lxml")
     table = soup.find("table", {"class": lambda c: c and "rgMasterTable" in c})

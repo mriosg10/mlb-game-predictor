@@ -21,6 +21,10 @@ logger = logging.getLogger(__name__)
 # Statcast pitch types considered fastballs for spin-rate aggregation
 _FASTBALL_TYPES = {"FF", "SI", "FC", "FS"}
 
+# Shared cache for full-MLB Statcast windows — keyed by (start_str, end_str).
+# Prevents downloading the same 50–80K-row dataset once per team per cycle.
+_statcast_window_cache: dict[tuple, Any] = {}
+
 
 def _safe_import_pybaseball():
     try:
@@ -140,20 +144,31 @@ def get_bullpen_statcast(
     start_date = end_date - timedelta(days=days)
     start_str = start_date.strftime("%Y-%m-%d")
     end_str = end_date.strftime("%Y-%m-%d")
+    window_key = (start_str, end_str)
 
-    try:
-        df = pb.statcast(start_dt=start_str, end_dt=end_str)
-        if df is None or df.empty:
+    if window_key in _statcast_window_cache:
+        df = _statcast_window_cache[window_key]
+    else:
+        try:
+            df = pb.statcast(start_dt=start_str, end_dt=end_str)
+            if df is None or df.empty:
+                _statcast_window_cache[window_key] = pd.DataFrame()
+                return defaults
+            _statcast_window_cache[window_key] = df
+            logger.debug("Statcast window %s–%s cached (%d rows)", start_str, end_str, len(df))
+        except Exception as exc:
+            logger.warning("bullpen statcast fetch failed for %s: %s", team_abbr, exc)
             return defaults
-    except Exception as exc:
-        logger.warning("bullpen statcast fetch failed for %s: %s", team_abbr, exc)
+
+    if df.empty:
         return defaults
 
-    # Filter to pitchers on the given team (away_team = opponent when pitching)
-    # MLB abbreviations in Statcast may differ; use 'home_team'/'away_team'
-    # column against both sides since we just want team pitching events.
+    # In Statcast, "Top" = away team batting (home team pitching),
+    # "Bot" = home team batting (away team pitching).
+    # Filter to only rows where team_abbr is the pitching side.
     team_pitching = df[
-        (df["home_team"] == team_abbr) | (df["away_team"] == team_abbr)
+        ((df["home_team"] == team_abbr) & (df["inning_topbot"] == "Top")) |
+        ((df["away_team"] == team_abbr) & (df["inning_topbot"] == "Bot"))
     ]
 
     if "estimated_woba_using_speedangle" not in team_pitching.columns:

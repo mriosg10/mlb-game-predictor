@@ -45,7 +45,6 @@ def retry_with_backoff(
                         func.__qualname__, attempt + 1, retries, exc, delay,
                     )
                     time.sleep(delay)
-            raise last_exc  # should be unreachable
         return wrapper
     return decorator
 

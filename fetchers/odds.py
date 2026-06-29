@@ -9,6 +9,7 @@ ou_line as None and fall back to the synthetic formula.
 
 import logging
 from datetime import date, timedelta, timezone, datetime
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -93,9 +94,8 @@ def fetch_ou_lines(game_date: date) -> dict[str, float]:
         logger.warning("Odds API fetch failed: %s", exc)
         return {}
 
-    # The API returns events in the requested window; commence_time is UTC ISO.
-    # target_dates kept as a safety net for any edge cases in the window.
-    target_dates = {game_date.isoformat(), (game_date + timedelta(days=1)).isoformat()}
+    _ET = ZoneInfo("America/New_York")
+    target_date_str = game_date.isoformat()
 
     result: dict[str, float] = {}
     remaining = resp.headers.get("x-requests-remaining", "?")
@@ -103,8 +103,14 @@ def fetch_ou_lines(game_date: date) -> dict[str, float]:
 
     for event in data:
         commence_utc = event.get("commence_time", "")
-        event_date_utc = commence_utc[:10]  # "YYYY-MM-DD"
-        if event_date_utc not in target_dates:
+        # Convert to ET date to avoid next-day games bleeding in when
+        # the window straddles midnight UTC (commenceTimeTo = 06:00Z next day).
+        try:
+            dt_utc = datetime.fromisoformat(commence_utc.replace("Z", "+00:00"))
+            event_date_et = dt_utc.astimezone(_ET).date().isoformat()
+        except Exception:
+            event_date_et = commence_utc[:10]
+        if event_date_et != target_date_str:
             continue
 
         away_full = event.get("away_team", "")

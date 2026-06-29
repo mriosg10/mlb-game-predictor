@@ -12,9 +12,9 @@ Two separate models are used:
 
 import logging
 import os
-import pickle
 from typing import Any
 
+import joblib
 import numpy as np
 import pandas as pd
 import xgboost as xgb
@@ -23,6 +23,7 @@ from config import (
     CALIBRATOR_PATH, FEATURE_COLUMNS, LEAGUE_AVG, MODEL_VERSION,
     OU_FEATURE_COLUMNS, OU_MODEL_PATH, TOTAL_MODEL_PATH, WIN_MODEL_PATH,
 )
+from utils.features import add_composite_features
 
 logger = logging.getLogger(__name__)
 
@@ -41,24 +42,6 @@ _ou_model:    xgb.Booster | None = None
 _calibrator:  Any = None  # IsotonicRegression, or None if artifact absent
 
 
-def _add_composite_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Mirror of train._add_composite_features — must stay in sync."""
-    df = df.copy()
-    df["sum_sp_era_l3"] = (
-        df.get("home_sp_era_l3", LEAGUE_AVG["sp_era_l3"]) +
-        df.get("away_sp_era_l3", LEAGUE_AVG["sp_era_l3"])
-    )
-    df["sum_ops_14d"]   = (
-        df.get("home_ops_14d", LEAGUE_AVG["ops_14d"]) +
-        df.get("away_ops_14d", LEAGUE_AVG["ops_14d"])
-    )
-    df["avg_sp_k_pct"]  = (
-        df.get("home_sp_k_pct", LEAGUE_AVG["sp_k_pct"]) +
-        df.get("away_sp_k_pct", LEAGUE_AVG["sp_k_pct"])
-    ) / 2
-    return df
-
-
 def _load_calibrator() -> Any:
     """Load isotonic calibrator if artifact exists; returns None otherwise."""
     global _calibrator
@@ -66,8 +49,7 @@ def _load_calibrator() -> Any:
         return _calibrator
     if not os.path.exists(CALIBRATOR_PATH):
         return None
-    with open(CALIBRATOR_PATH, "rb") as f:
-        _calibrator = pickle.load(f)
+    _calibrator = joblib.load(CALIBRATOR_PATH)
     logger.info("Calibrator loaded: %s", CALIBRATOR_PATH)
     return _calibrator
 
@@ -171,7 +153,7 @@ def predict_game(
     """
     # Select and order feature columns; fill any unexpected NaN with column median
     df = pd.DataFrame([feature_row])
-    df = _add_composite_features(df)
+    df = add_composite_features(df)
 
     # Ensure all required columns exist; fill missing with 0 (should not happen
     # if assembler correctly gated on missing-feature threshold)
@@ -217,7 +199,7 @@ def predict_batch(
         return []
 
     df = pd.DataFrame(feature_rows)
-    df = _add_composite_features(df)
+    df = add_composite_features(df)
 
     # Inject real sportsbook O/U lines where available (overrides LEAGUE_AVG default)
     if ou_lines:

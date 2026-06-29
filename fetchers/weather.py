@@ -12,6 +12,7 @@ import logging
 import math
 from datetime import date, datetime, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -43,8 +44,13 @@ def _degrees_to_compass(deg: float) -> str:
     return "N"
 
 
+_OPEN_METEO_ARCHIVE = "https://archive-api.open-meteo.com/v1/archive"
+
+
 @retry_with_backoff(retries=3, backoff_base=2, exceptions=_TRANSIENT)
 def _fetch_open_meteo(lat: float, lon: float, target_date: date) -> dict:
+    # Past dates must use the archive endpoint; forecast endpoint only serves future data.
+    base_url = _OPEN_METEO_ARCHIVE if target_date < date.today() else OPEN_METEO_BASE
     params = {
         "latitude":  lat,
         "longitude": lon,
@@ -57,7 +63,7 @@ def _fetch_open_meteo(lat: float, lon: float, target_date: date) -> dict:
         # Note: do NOT include forecast_days when start_date/end_date are set —
         # they are mutually exclusive in the Open-Meteo API (causes HTTP 400).
     }
-    resp = requests.get(OPEN_METEO_BASE, params=params, timeout=HTTP_TIMEOUT)
+    resp = requests.get(base_url, params=params, timeout=HTTP_TIMEOUT)
     resp.raise_for_status()
     return resp.json()
 
@@ -95,15 +101,14 @@ def get_game_weather(
         logger.warning("Missing coordinates for venue '%s'; skipping weather", venue_name)
         return neutral
 
-    # Determine which hour to read (first-pitch local hour)
+    # Determine which hour to read (first-pitch local hour in ET)
+    # Open-Meteo returns hourly data in America/New_York local time when
+    # timezone="America/New_York" is set; we must convert UTC→ET the same way.
     first_pitch_hour = 19  # 7 PM ET default
     if game_datetime_utc:
         try:
             dt_utc = datetime.fromisoformat(game_datetime_utc.replace("Z", "+00:00"))
-            # Open-Meteo returns local-time hourly data (America/New_York)
-            # Convert UTC to ET: UTC-4 during DST, UTC-5 otherwise
-            # Using a simple -4 offset (season is Apr-Oct, mostly EDT)
-            first_pitch_hour = (dt_utc.hour - 4) % 24
+            first_pitch_hour = dt_utc.astimezone(ZoneInfo("America/New_York")).hour
         except Exception:
             pass
 

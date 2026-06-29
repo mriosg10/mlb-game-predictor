@@ -231,8 +231,8 @@ def _pitcher_row(prefix: str, team: str, name: str, hand: str,
 </tr>"""
 
 
-def _build_game_brief_cards(date_str: str) -> str:
-    """Build detailed HTML brief cards for every game on date_str."""
+def _build_game_brief_cards(date_str: str, cycle: str = "A") -> str:
+    """Build detailed HTML brief cards for every game on date_str using the given cycle's features."""
     from datetime import date as date_type
     from fetchers.mlb_stats import (
         get_schedule, get_player, get_umpire_assignments,
@@ -273,9 +273,9 @@ def _build_game_brief_cards(date_str: str) -> str:
                 p.ou_prob, p.ou_line
             FROM features f
             JOIN predictions p ON f.game_id = p.game_id AND f.cycle = p.cycle
-            WHERE f.game_date = ? AND f.cycle = 'A'
+            WHERE f.game_date = ? AND f.cycle = ?
             ORDER BY GREATEST(p.home_win_prob, p.away_win_prob) DESC
-        """, [date_str]).fetchall()
+        """, [date_str, cycle]).fetchall()
         conn.close()
     except Exception as exc:
         logger.warning("Notifier brief: DB query failed: %s", exc)
@@ -461,7 +461,7 @@ def notify_cycle_b(game_date: date, status: dict) -> None:
     briefs_html = ""
     if run_status in ("SUCCESS", "PARTIAL") and n_games > 0:
         try:
-            briefs_html = _build_game_brief_cards(date_str)
+            briefs_html = _build_game_brief_cards(date_str, cycle="B")
         except Exception as exc:
             logger.warning("Notifier: brief build failed: %s", exc)
 
@@ -486,7 +486,7 @@ def notify_post_game(game_date: date, status: dict) -> None:
     metrics: dict = {}
     try:
         conn = duckdb.connect(DB_PATH, read_only=True)
-        rows = conn.execute("""
+        _results_sql = """
             SELECT
                 f.away_team || ' @ ' || f.home_team          AS matchup,
                 CASE WHEN p.home_win_prob >= 0.5
@@ -505,19 +505,26 @@ def notify_post_game(game_date: date, status: dict) -> None:
             FROM predictions p
             JOIN features f ON p.game_id = f.game_id AND p.cycle = f.cycle
             JOIN results  r ON p.game_id = r.game_id
-            WHERE f.game_date = ? AND p.cycle = 'A'
+            WHERE f.game_date = ? AND p.cycle = ?
             ORDER BY f.game_date
-        """, [date_str]).fetchall()
-
-        row = conn.execute("""
+        """
+        _eval_sql = """
             SELECT brier_score, win_accuracy, total_mae, games_evaluated
             FROM evaluation_log
-            WHERE log_date = ? AND cycle = 'A'
+            WHERE log_date = ? AND cycle = ?
             ORDER BY created_at DESC LIMIT 1
-        """, [date_str]).fetchone()
-        if row:
-            metrics = {"brier": row[0], "win_acc": row[1],
-                       "mae": row[2], "n": row[3]}
+        """
+        # Prefer Cycle B; fall back to Cycle A when B data is absent
+        for cycle_pref in ("B", "A"):
+            rows = conn.execute(_results_sql, [date_str, cycle_pref]).fetchall()
+            if rows:
+                break
+        for cycle_pref in ("B", "A"):
+            row = conn.execute(_eval_sql, [date_str, cycle_pref]).fetchone()
+            if row:
+                metrics = {"brier": row[0], "win_acc": row[1],
+                           "mae": row[2], "n": row[3]}
+                break
         conn.close()
     except Exception as exc:
         logger.warning("Notifier: DB query failed: %s", exc)

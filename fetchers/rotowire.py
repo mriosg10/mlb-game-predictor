@@ -175,7 +175,14 @@ def _parse_card(card: Tag) -> GameLineups | None:
     away_batters = _extract_batters(visit_list)
     home_batters = _extract_batters(home_list)
 
-    is_confirmed = bool(card.find(class_=re.compile(r"is-confirmed")))
+    # Check is_confirmed per team so a confirmed home lineup doesn't imply
+    # the away lineup is confirmed (and vice versa).
+    home_confirmed = bool(home_list and home_list.find(class_=re.compile(r"is-confirmed")))
+    away_confirmed = bool(visit_list and visit_list.find(class_=re.compile(r"is-confirmed")))
+    if not home_confirmed and not away_confirmed:
+        # Fallback: card-level confirmation flag (older page layouts)
+        card_confirmed = bool(card.find(class_=re.compile(r"is-confirmed")))
+        home_confirmed = away_confirmed = card_confirmed
 
     return GameLineups(
         home=ConfirmedLineup(
@@ -183,14 +190,14 @@ def _parse_card(card: Tag) -> GameLineups | None:
             pitcher_name=home_pitcher_name,
             pitcher_hand=home_pitcher_hand,
             batting_order=home_batters,
-            is_confirmed=is_confirmed,
+            is_confirmed=home_confirmed,
         ),
         away=ConfirmedLineup(
             team_abbr=away_abbr,
             pitcher_name=away_pitcher_name,
             pitcher_hand=away_pitcher_hand,
             batting_order=away_batters,
-            is_confirmed=is_confirmed,
+            is_confirmed=away_confirmed,
         ),
         game_time=game_time,
     )

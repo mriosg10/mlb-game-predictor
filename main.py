@@ -65,13 +65,12 @@ def _maybe_train_ou_model() -> None:
 
     import duckdb
     try:
-        conn = duckdb.connect(DB_PATH, read_only=True)
-        n_ou = conn.execute("""
-            SELECT COUNT(*) FROM predictions p
-            JOIN results r ON p.game_id = r.game_id
-            WHERE p.ou_line IS NOT NULL AND p.cycle = 'B'
-        """).fetchone()[0]
-        conn.close()
+        with duckdb.connect(DB_PATH, read_only=True) as conn:
+            n_ou = conn.execute("""
+                SELECT COUNT(*) FROM predictions p
+                JOIN results r ON p.game_id = r.game_id
+                WHERE p.ou_line IS NOT NULL AND p.cycle = 'B'
+            """).fetchone()[0]
     except Exception as exc:
         logger.warning("OU threshold check failed: %s", exc)
         return

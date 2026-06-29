@@ -26,7 +26,7 @@ from typing import Any
 
 import database as db
 from features.assembler import assemble_game_features
-from fetchers.mlb_stats import get_player, get_schedule, get_il_transactions
+from fetchers.mlb_stats import get_player, get_schedule, get_il_transactions, search_player_by_name
 from fetchers.odds import fetch_ou_lines
 from fetchers.rotowire import ConfirmedLineup, GameLineups, get_confirmed_lineups
 from model.inference import ModelNotFoundError, load_models, predict_batch
@@ -227,17 +227,23 @@ def run(game_date: date | None = None) -> dict[str, Any]:
                 confirmed_lineup_count += 1
                 used_confirmed_lineup = True
 
-                # Home pitcher
+                # Home pitcher — resolve MLBAM ID so stat lookups use confirmed starter
                 if gl.home.pitcher_name and gl.home.pitcher_name != "TBD":
+                    _home_id = search_player_by_name(gl.home.pitcher_name)
+                    if _home_id is None:
+                        _home_id = game.get("home_probable_id")
                     home_pitcher_override = {
-                        "id":   None,   # RotoWire doesn't provide MLBAM IDs
+                        "id":   _home_id,
                         "name": gl.home.pitcher_name,
                         "hand": gl.home.pitcher_hand,
                     }
-                # Away pitcher
+                # Away pitcher — resolve MLBAM ID so stat lookups use confirmed starter
                 if gl.away.pitcher_name and gl.away.pitcher_name != "TBD":
+                    _away_id = search_player_by_name(gl.away.pitcher_name)
+                    if _away_id is None:
+                        _away_id = game.get("away_probable_id")
                     away_pitcher_override = {
-                        "id":   None,
+                        "id":   _away_id,
                         "name": gl.away.pitcher_name,
                         "hand": gl.away.pitcher_hand,
                     }

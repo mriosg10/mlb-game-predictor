@@ -1,6 +1,12 @@
 """
 Historical training data builder — v2 (FanGraphs-free).
 
+Known limitations:
+  ou_line is absent from historical data (The Odds API wasn't scraped historically).
+  build_feature_row() omits it; FEATURE_COLUMNS fills it with LEAGUE_AVG["ou_line"]
+  during training.  The live pipeline writes a real sportsbook line at Cycle B time,
+  so there is a train/serve skew for ou_line in the early weeks of each season.
+
 Data sources (all confirmed working as of 2026):
   Pitcher quality: Baseball Reference (pitching_stats_bref) for FIP/K%/BB%
                    Baseball Savant (statcast_pitcher_expected_stats) for xERA
@@ -65,10 +71,14 @@ def _cp(key: str) -> Path:
 
 def _load(key: str):
     p = _cp(key)
-    return json.load(open(p)) if p.exists() else None
+    if not p.exists():
+        return None
+    with open(p) as f:
+        return json.load(f)
 
 def _save(key: str, data) -> None:
-    json.dump(data, open(_cp(key), "w"))
+    with open(_cp(key), "w") as f:
+        json.dump(data, f)
 
 def _mlb_get(path: str, params: dict = None, retries: int = 3) -> dict:
     url = f"{MLB_BASE}{path}"
@@ -333,11 +343,11 @@ def fetch_team_batting(season: int) -> dict[str, dict]:
 def _parse_ip(ip_str) -> float:
     """Convert MLB API inningsPitched string ('5.2') to decimal innings."""
     try:
-        raw = float(ip_str or 0)
-        whole = int(raw)
-        thirds = round(raw - whole, 1)
-        # .1 = 1/3, .2 = 2/3 — convert to decimal
-        return whole + (thirds / 0.3) * (1 / 3)
+        s = str(ip_str or "0").strip()
+        if "." in s:
+            whole, thirds = s.split(".", 1)
+            return int(whole) + int(thirds[:1]) / 3
+        return float(s)
     except Exception:
         return 0.0
 
@@ -981,6 +991,30 @@ def compute_daily_bp_ip(relief_logs: dict, team_id_map: dict) -> dict:
     return dict(daily)
 
 
+def compute_team_bp_xera(relief_logs: dict, team_id_map: dict, pitcher_stats: dict) -> dict:
+    """IP-weighted average xERA per team using each reliever's prev-season xERA."""
+    from collections import defaultdict
+    team_ip: dict[str, dict[int, float]] = defaultdict(lambda: defaultdict(float))
+    for pid, appearances in relief_logs.items():
+        pid_int = int(pid) if not isinstance(pid, int) else pid
+        for app in appearances:
+            abbr = team_id_map.get(app.get("team_id"))
+            if abbr:
+                team_ip[abbr][pid_int] += app.get("ip", 0.0)
+    result = {}
+    for abbr, pid_ips in team_ip.items():
+        total_ip = sum(pid_ips.values())
+        if total_ip <= 0:
+            result[abbr] = LEAGUE_AVG["bp_xera"]
+            continue
+        weighted = sum(
+            pitcher_stats.get(pid, {}).get("xera", LEAGUE_AVG["bp_xera"]) * ip
+            for pid, ip in pid_ips.items()
+        )
+        result[abbr] = float(np.clip(weighted / total_ip, 0.5, 7.0))
+    return result
+
+
 def get_bp_ip_3d(team: str, game_date_str: str, daily_bp_ip: dict) -> float:
     """Total bullpen IP for `team` in the 3 calendar days before game_date."""
     gd = datetime.strptime(game_date_str, "%Y-%m-%d")
@@ -1062,7 +1096,7 @@ def get_il_counts(team_abbr: str, game_date_str: str, il_transactions: dict) -> 
                 on_il_pitchers.add(pid)
             else:
                 on_il_non_pitchers.add(pid)
-        elif type_code in ("CRA", "REL"):
+        elif type_code in ("REA", "ACT"):  # reinstated / activated
             on_il_pitchers.discard(pid)
             on_il_non_pitchers.discard(pid)
 
@@ -1172,7 +1206,8 @@ def build_feature_row(game: dict, pitchers: dict, batting: dict, game_logs: dict
                       risp_map: dict = None, il_transactions: dict = None,
                       schedule_features: dict = None, win_streaks: dict = None,
                       roster_hands: dict = None, bp_li_map: dict = None,
-                      umpire_map: dict = None, team_days_rest: dict = None) -> dict:
+                      umpire_map: dict = None, team_days_rest: dict = None,
+                      team_bp_xera: dict = None) -> dict:
     home_sp = _sp(game.get("home_sp_id"), pitchers)
     away_sp = _sp(game.get("away_sp_id"), pitchers)
     home_b  = _team(game["home_team"], batting)
@@ -1247,9 +1282,9 @@ def build_feature_row(game: dict, pitchers: dict, batting: dict, game_logs: dict
     _avg_r = _ump_stats.get("avg_runs")
     umpire_run_factor = round(float(_avg_r) / _LEAGUE_AVG_RUNS, 3) if _avg_r else LEAGUE_AVG["umpire_run_factor"]
 
-    def _fip_bp(sp_stats):
-        """Bullpen xERA proxy: SP xFIP * 1.05 (bullpen ERA typically slightly higher)."""
-        return min(sp_stats.get("xfip", LEAGUE_AVG["sp_xfip"]) * 1.05, 7.0)
+    _bp_xera = team_bp_xera or {}
+    def _fip_bp(team_abbr):
+        return _bp_xera.get(team_abbr, LEAGUE_AVG["bp_xera"])
 
     return {
         "game_id":   game["game_id"],
@@ -1292,12 +1327,12 @@ def build_feature_row(game: dict, pitchers: dict, batting: dict, game_logs: dict
         "away_sp_whip_l3":       a_whip_l3,
         "away_sp_xera_delta":    round(float(away_sp["xera"]) - float(away_sp["fip"]), 3),
         # Home BP
-        "home_bp_xera":   _fip_bp(home_sp),
+        "home_bp_xera":   _fip_bp(game["home_team"]),
         "home_bp_ip_3d":  home_bip,
         "home_bp_li":     home_bp_li_val,
         "home_bp_il_ct":  home_bp_il,
         # Away BP
-        "away_bp_xera":   _fip_bp(away_sp),
+        "away_bp_xera":   _fip_bp(game["away_team"]),
         "away_bp_ip_3d":  away_bip,
         "away_bp_li":     away_bp_li_val,
         "away_bp_il_ct":  away_bp_il,
@@ -1372,6 +1407,8 @@ def main():
         relief_logs     = fetch_pitcher_relief_logs(season, all_pitcher_ids, starter_ids)
         daily_bp_ip     = compute_daily_bp_ip(relief_logs, team_id_map)
         logger.info("Daily BP IP computed for %d team-date pairs", len(daily_bp_ip))
+        team_bp_xera    = compute_team_bp_xera(relief_logs, team_id_map, pitchers)
+        logger.info("Team BP xERA computed for %d teams", len(team_bp_xera))
 
         # NEW: season run differentials (computed from already-fetched schedule)
         run_diffs = compute_run_diffs(games)
@@ -1435,7 +1472,8 @@ def main():
                                     roster_hands=roster_hands,
                                     bp_li_map=bp_li_map,
                                     umpire_map=umpire_map,
-                                    team_days_rest=team_days_rest_map)
+                                    team_days_rest=team_days_rest_map,
+                                    team_bp_xera=team_bp_xera)
             all_rows.append(row)
             hs, as_ = game["home_score"], game["away_score"]
             all_results.append({

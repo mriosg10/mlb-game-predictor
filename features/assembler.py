@@ -85,7 +85,7 @@ def _compute_days_rest(pitcher_id: int, game_date: date) -> int:
         if not starts:
             return LEAGUE_AVG["sp_days_rest"]
 
-        last_date_str = starts[-1].get("date", "")
+        last_date_str = max(starts, key=lambda s: s.get("date", "")).get("date", "")
         if not last_date_str:
             return LEAGUE_AVG["sp_days_rest"]
 
@@ -145,22 +145,14 @@ def _build_pitcher_features(
     feats: dict[str, Any] = {}
     missing: list[str] = []
 
-    # --- Statcast contact-quality block (barrel%, exit velo, hard-hit%) ---
+    # All Statcast and BRef stats come from lightweight season-aggregate tables;
+    # no per-pitcher pitch-by-pitch download (get_pitcher_statcast removed).
     if pitcher_id:
-        sc = savant.get_pitcher_statcast(pitcher_id, season)
         fg = fangraphs.get_pitcher_fangraphs(pitcher_id, pitcher_name, season)
-        sv = get_pitcher_savant_extras(pitcher_id, season)  # xERA, spin
+        sv = get_pitcher_savant_extras(pitcher_id, season)
     else:
-        sc = {"_imputed": True}
         fg = {"_imputed": True}
         sv = {"_imputed": True}
-
-    def _sc(key: str, fallback_key: str) -> float:
-        val = sc.get(key)
-        if val is None:
-            missing.append(f"{prefix}_{fallback_key}")
-            return LEAGUE_AVG[f"sp_{fallback_key}"]
-        return float(val)
 
     def _fg(key: str, fallback_key: str) -> float:
         val = fg.get(key)
@@ -182,9 +174,9 @@ def _build_pitcher_features(
     feats[f"{prefix}_siera"]         = _fg("siera",         "siera")
     feats[f"{prefix}_k_pct"]         = _fg("k_pct",         "k_pct")
     feats[f"{prefix}_bb_pct"]        = _fg("bb_pct",        "bb_pct")
-    feats[f"{prefix}_barrel"]        = _sc("barrel_pct",    "barrel")
-    feats[f"{prefix}_hh_pct"]        = _sc("hard_hit_pct",  "hh_pct")
-    feats[f"{prefix}_exit_velo"]     = _sc("avg_exit_velo", "exit_velo")
+    feats[f"{prefix}_barrel"]        = _sv("barrel_pct",    "barrel")
+    feats[f"{prefix}_hh_pct"]        = _sv("hard_hit_pct",  "hh_pct")
+    feats[f"{prefix}_exit_velo"]     = _sv("avg_exit_velo", "exit_velo")
     feats[f"{prefix}_spin"]          = _sv("fastball_spin", "spin")
 
     # Days rest
@@ -411,6 +403,7 @@ def assemble_game_features(
     game_datetime_utc = game.get("game_datetime_utc")
 
     all_missing: list[str] = []
+    season = game_date.year
 
     # --- Resolve starters ---
     home_sp_id   = (home_pitcher_override or {}).get("id") or game.get("home_probable_id")
@@ -421,20 +414,23 @@ def assemble_game_features(
     away_sp_name = (away_pitcher_override or {}).get("name", "")
     away_sp_hand = (away_pitcher_override or {}).get("hand", "R")
 
-    # Enrich names/hands from MLB API if not provided
-    if home_sp_id and not home_sp_name:
+    # Always enrich name + hand from MLB API when we have an ID.
+    # Hand defaults to "R" only when the API call fails.
+    if home_sp_id:
         try:
             p = mlb_stats.get_player(home_sp_id)
-            home_sp_name = p.get("full_name", "")
-            home_sp_hand = p.get("pitch_hand", "R")
+            if not home_sp_name:
+                home_sp_name = p.get("full_name", "")
+            home_sp_hand = p.get("pitch_hand", home_sp_hand)
         except Exception:
             pass
 
-    if away_sp_id and not away_sp_name:
+    if away_sp_id:
         try:
             p = mlb_stats.get_player(away_sp_id)
-            away_sp_name = p.get("full_name", "")
-            away_sp_hand = p.get("pitch_hand", "R")
+            if not away_sp_name:
+                away_sp_name = p.get("full_name", "")
+            away_sp_hand = p.get("pitch_hand", away_sp_hand)
         except Exception:
             pass
 
@@ -442,37 +438,37 @@ def assemble_game_features(
     # home SP faces the away lineup; away SP faces the home lineup
     home_sp_feats, home_sp_missing = _build_pitcher_features(
         "home_sp", home_sp_id, home_sp_name, home_sp_hand,
-        away_lineup or [], game_date,
+        away_lineup or [], game_date, season=season,
         opp_team_id=away_team_id,
     )
     all_missing.extend(home_sp_missing)
 
     away_sp_feats, away_sp_missing = _build_pitcher_features(
         "away_sp", away_sp_id, away_sp_name, away_sp_hand,
-        home_lineup or [], game_date,
+        home_lineup or [], game_date, season=season,
         opp_team_id=home_team_id,
     )
     all_missing.extend(away_sp_missing)
 
     home_bp_feats, home_bp_missing = _build_bullpen_features(
-        "home_bp", home_team, home_team_id, game_date,
+        "home_bp", home_team, home_team_id, game_date, season=season,
     )
     all_missing.extend(home_bp_missing)
 
     away_bp_feats, away_bp_missing = _build_bullpen_features(
-        "away_bp", away_team, away_team_id, game_date,
+        "away_bp", away_team, away_team_id, game_date, season=season,
     )
     all_missing.extend(away_bp_missing)
 
     home_lu_feats, home_lu_missing = _build_lineup_features(
         "home", home_team, home_team_id, game_date, home_lineup or [],
-        opp_abbr=away_team,
+        season=season, opp_abbr=away_team,
     )
     all_missing.extend(home_lu_missing)
 
     away_lu_feats, away_lu_missing = _build_lineup_features(
         "away", away_team, away_team_id, game_date, away_lineup or [],
-        opp_abbr=home_team,
+        season=season, opp_abbr=home_team,
     )
     all_missing.extend(away_lu_missing)
 
@@ -515,7 +511,9 @@ def assemble_game_features(
     row["ou_line"] = LEAGUE_AVG["ou_line"]
 
     # --- Missing-feature gate (AC-10 / Section 5.4) ---
-    total_features = len(FEATURE_COLUMNS)
+    # Subtract 3 composite features (sum_sp_era_l3, sum_ops_14d, avg_sp_k_pct) from
+    # the denominator — they are computed at inference time, never fetched or tracked.
+    total_features = len(FEATURE_COLUMNS) - 3
     missing_count = len(set(all_missing))
     missing_pct = missing_count / total_features
 

@@ -16,12 +16,12 @@ Outputs:
 
 import argparse
 import logging
-import pickle
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import joblib
 import numpy as np
 import pandas as pd
 import xgboost as xgb
@@ -31,9 +31,10 @@ from sklearn.model_selection import TimeSeriesSplit
 
 from config import (
     BASE_DIR, CALIBRATOR_PATH, DB_PATH, FEATURE_COLUMNS, LEAGUE_AVG,
-    MODEL_DIR, OU_FEATURE_COLUMNS, OU_MODEL_PATH,
+    MODEL_DIR, OU_FEATURE_COLUMNS, OU_MIN_GAMES, OU_MODEL_PATH,
     TOTAL_MODEL_PATH, WIN_MODEL_PATH,
 )
+from utils.features import add_composite_features
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
@@ -94,33 +95,11 @@ _SEASON_WEIGHTS = {2019: 0.2, 2021: 0.3, 2022: 0.5, 2023: 0.7, 2024: 0.85, 2025:
 # Composite feature computation (derived at train + inference time)
 # ---------------------------------------------------------------------------
 
-def _add_composite_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Add run-environment composite columns derived from existing features.
-    Called in load_data() and train_ou_model() so both models see them.
-    These do NOT need to be stored in the parquet/DB — computed on the fly.
-    """
-    df = df.copy()
-    df["sum_sp_era_l3"] = (
-        df.get("home_sp_era_l3", LEAGUE_AVG["sp_era_l3"]) +
-        df.get("away_sp_era_l3", LEAGUE_AVG["sp_era_l3"])
-    )
-    df["sum_ops_14d"]   = (
-        df.get("home_ops_14d", LEAGUE_AVG["ops_14d"]) +
-        df.get("away_ops_14d", LEAGUE_AVG["ops_14d"])
-    )
-    df["avg_sp_k_pct"]  = (
-        df.get("home_sp_k_pct", LEAGUE_AVG["sp_k_pct"]) +
-        df.get("away_sp_k_pct", LEAGUE_AVG["sp_k_pct"])
-    ) / 2
-    return df
-
-
 # ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
 
-_COMPOSITE_FEATURES = {"sum_sp_era_l3", "sum_ops_14d", "avg_sp_k_pct"}
+from utils.features import COMPOSITE_FEATURES as _COMPOSITE_FEATURES
 
 
 def load_live_data() -> pd.DataFrame:
@@ -161,6 +140,21 @@ def load_live_data() -> pd.DataFrame:
     try:
         conn = duckdb.connect(DB_PATH, read_only=True)
         df = conn.execute(sql).fetchdf()
+        # Replace features.ou_line (always LEAGUE_AVG default) with the real
+        # sportsbook line from the predictions table so OU training sees true lines.
+        try:
+            pred_ou = conn.execute("""
+                SELECT game_id, ou_line FROM predictions
+                WHERE cycle = 'B' AND ou_line IS NOT NULL
+            """).fetchdf()
+            pred_ou["game_id"] = pred_ou["game_id"].astype(str)
+            if not pred_ou.empty and "ou_line" in df.columns:
+                df = df.merge(pred_ou.rename(columns={"ou_line": "_real_ou"}),
+                              on="game_id", how="left")
+                df["ou_line"] = df["_real_ou"].combine_first(df["ou_line"])
+                df = df.drop(columns=["_real_ou"])
+        except Exception as exc:
+            logger.debug("ou_line enrichment skipped: %s", exc)
         conn.close()
         df["game_id"] = df["game_id"].astype(str)
         logger.info("Live DB: %d games with results (%d feature cols from DB)",
@@ -203,7 +197,7 @@ def load_data(include_live: bool = False) -> tuple[pd.DataFrame, pd.Series, pd.S
             )
             n_live = len(live_df)
 
-    df = _add_composite_features(df)
+    df = add_composite_features(df)
 
     # Join ou_line from historical CSV; games without a real line get league average
     ou_path = BASE_DIR / "data" / "historical_ou.csv"
@@ -292,8 +286,8 @@ def tune_hyperparams(
 
     def total_objective(trial):
         params = {
-            "objective":        "reg:squarederror",
-            "eval_metric":      "mae",
+            "objective":        "count:poisson",
+            "eval_metric":      "poisson-nloglik",
             "n_estimators":     trial.suggest_int("n_estimators", 200, 800),
             "max_depth":        trial.suggest_int("max_depth", 3, 6),
             "learning_rate":    trial.suggest_float("learning_rate", 0.01, 0.15, log=True),
@@ -353,17 +347,25 @@ def train_and_evaluate(
     """
     wp = win_params or WIN_PARAMS
     tp = total_params or TOTAL_PARAMS
-    tscv = TimeSeriesSplit(n_splits=cv_folds)
     sw = sample_weight
 
-    brier_scores, mae_scores = [], []
-    oof_probs, oof_labels = [], []
+    # Reserve the last 15% of data (chronologically) as calibration holdout.
+    # CV and final model training use only X_main; calibrator is fitted on
+    # final-model predictions for X_cal (data the final model never saw).
+    cal_n = max(100, int(len(X) * 0.15))
+    X_main,     X_cal     = X.iloc[:-cal_n],      X.iloc[-cal_n:]
+    y_win_main, y_win_cal = y_win.iloc[:-cal_n],  y_win.iloc[-cal_n:]
+    y_total_main          = y_total.iloc[:-cal_n]
+    sw_main = sw.iloc[:-cal_n] if sw is not None else None
 
-    for fold, (train_idx, val_idx) in enumerate(tscv.split(X)):
-        X_tr, X_val = X.iloc[train_idx], X.iloc[val_idx]
-        y_win_tr,   y_win_val   = y_win.iloc[train_idx],   y_win.iloc[val_idx]
-        y_total_tr, y_total_val = y_total.iloc[train_idx], y_total.iloc[val_idx]
-        w_tr = sw.iloc[train_idx] if sw is not None else None
+    tscv = TimeSeriesSplit(n_splits=cv_folds)
+    brier_scores, mae_scores = [], []
+
+    for fold, (train_idx, val_idx) in enumerate(tscv.split(X_main)):
+        X_tr, X_val = X_main.iloc[train_idx], X_main.iloc[val_idx]
+        y_win_tr,   y_win_val   = y_win_main.iloc[train_idx],   y_win_main.iloc[val_idx]
+        y_total_tr, y_total_val = y_total_main.iloc[train_idx], y_total_main.iloc[val_idx]
+        w_tr = sw_main.iloc[train_idx] if sw_main is not None else None
 
         clf = xgb.XGBClassifier(**wp, use_label_encoder=False)
         clf.fit(X_tr, y_win_tr, sample_weight=w_tr,
@@ -376,20 +378,11 @@ def train_and_evaluate(
         p_win   = clf.predict_proba(X_val)[:, 1]
         p_total = reg.predict(X_val)
 
-        oof_probs.extend(p_win.tolist())
-        oof_labels.extend(y_win_val.tolist())
-
         brier_raw = brier_score_loss(y_win_val, p_win)
         mae       = mean_absolute_error(y_total_val, p_total)
         brier_scores.append(brier_raw)
         mae_scores.append(mae)
         logger.info("Fold %d: Brier=%.4f  MAE=%.4f", fold + 1, brier_raw, mae)
-
-    # Fit isotonic calibration on OOF predictions
-    calibrator = IsotonicRegression(out_of_bounds="clip")
-    calibrator.fit(oof_probs, oof_labels)
-    cal_probs = calibrator.predict(oof_probs)
-    brier_cal = brier_score_loss(oof_labels, cal_probs)
 
     logger.info(
         "CV summary: Brier=%.4f±%.4f  MAE=%.4f±%.4f  Brier(calibrated)=%.4f",
@@ -403,14 +396,21 @@ def train_and_evaluate(
     if np.mean(mae_scores) >= 1.8:
         logger.warning("CV MAE %.4f does not meet <1.8 threshold (AC-05).", np.mean(mae_scores))
 
-    # Final fit on all data
-    logger.info("Training final models on full dataset...")
+    # Final fit on X_main (calibration holdout excluded so calibrator sees unseen data)
+    logger.info("Training final models on main dataset (%d games)...", len(X_main))
+    w_main = sw_main.values if sw_main is not None else None
     final_clf = xgb.XGBClassifier(**wp, use_label_encoder=False)
-    w_all = sw.values if sw is not None else None
-    final_clf.fit(X, y_win, sample_weight=w_all, verbose=False)
+    final_clf.fit(X_main, y_win_main, sample_weight=w_main, verbose=False)
 
     final_reg = xgb.XGBRegressor(**tp)
-    final_reg.fit(X, y_total, sample_weight=w_all, verbose=False)
+    final_reg.fit(X_main, y_total_main, sample_weight=w_main, verbose=False)
+
+    # Fit isotonic calibrator on holdout predictions (final model never saw X_cal)
+    cal_probs_raw = final_clf.predict_proba(X_cal)[:, 1]
+    calibrator = IsotonicRegression(out_of_bounds="clip")
+    calibrator.fit(cal_probs_raw, y_win_cal.values)
+    cal_probs = calibrator.predict(cal_probs_raw)
+    brier_cal = brier_score_loss(y_win_cal.values, cal_probs)
 
     if return_metrics:
         cv_metrics = {
@@ -451,16 +451,42 @@ def train_ou_model(
         logger.warning("OU model training skipped — 'ou_line' column missing in %s", ou_path)
         return _no_model()
 
-    # Drop LEAGUE_AVG ou_line default before joining real market lines
+    # Historical games: merge real ou_lines from the CSV (inner join)
     base = features_df.drop(columns=["ou_line"], errors="ignore")
-    df = base.merge(ou_df[["game_id", "ou_line"]], on="game_id", how="inner")
+    hist_df = base.merge(ou_df[["game_id", "ou_line"]], on="game_id", how="inner")
+
+    # Live games: load_live_data() enriches ou_line from the predictions table.
+    # Include any live game that has a real line (not the LEAGUE_AVG 8.7 default)
+    # and a result, and isn't already covered by the historical CSV.
+    live_ou_df = pd.DataFrame()
+    if "ou_line" in features_df.columns and "total_runs" in features_df.columns:
+        _default = LEAGUE_AVG["ou_line"]
+        live_with_real = features_df[
+            features_df["ou_line"].notna() &
+            (features_df["ou_line"] != _default) &
+            features_df["total_runs"].notna() &
+            ~features_df["game_id"].isin(hist_df["game_id"])
+        ].copy()
+        if not live_with_real.empty:
+            live_ou_df = live_with_real
+            logger.info("OU training: %d live games with real ou_line added", len(live_ou_df))
+
+    df = pd.concat([hist_df, live_ou_df], ignore_index=True)
     if df.empty:
         logger.warning("OU model training skipped — no games matched after join")
         return _no_model()
 
+    if len(df) < OU_MIN_GAMES:
+        logger.warning(
+            "OU model training skipped — only %d labeled games (need ≥ %d). "
+            "Accumulate more games with real ou_line before training.",
+            len(df), OU_MIN_GAMES,
+        )
+        return _no_model()
+
     df = df.dropna(subset=["ou_line", "total_runs"])
     df["over"] = (df["total_runs"] > df["ou_line"]).astype(int)
-    df = _add_composite_features(df)
+    df = add_composite_features(df)
 
     for col in OU_FEATURE_COLUMNS:
         if col not in df.columns:
@@ -532,8 +558,7 @@ def main():
 
     clf.get_booster().save_model(WIN_MODEL_PATH)
     reg.get_booster().save_model(TOTAL_MODEL_PATH)
-    with open(CALIBRATOR_PATH, "wb") as f:
-        pickle.dump(calibrator, f)
+    joblib.dump(calibrator, CALIBRATOR_PATH)
     logger.info("Models saved:\n  %s\n  %s\n  %s",
                 WIN_MODEL_PATH, TOTAL_MODEL_PATH, CALIBRATOR_PATH)
 
